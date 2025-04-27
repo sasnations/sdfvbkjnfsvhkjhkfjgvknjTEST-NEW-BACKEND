@@ -14,7 +14,8 @@ import {
   addGmailCredential,
   updateGmailCredential,
   deleteGmailCredential,
-  updateGmailCredentialStatus
+  updateGmailCredentialStatus,
+  verifyCredential
 } from '../services/gmailService.js';
 
 const router = express.Router();
@@ -72,6 +73,66 @@ router.post('/rotate', async (req, res) => {
   try {
     // Allow both authenticated and unauthenticated users
     const userId = req.user?.id || req.body.userId || `anon_${uuidv4()}`;
+    
+    const result = await rotateUserAlias(userId);
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Failed to rotate Gmail alias:', error);
+    res.status(400).json({ error: error.message || 'Failed to rotate Gmail alias' });
+  }
+});
+
+// ==================== Public Routes ====================
+
+// Public routes for non-authenticated users
+router.post('/public/create', async (req, res) => {
+  try {
+    const userId = `anon_${uuidv4()}`;
+    const { strategy } = req.body; // 'dot' or 'plus'
+    
+    const result = await generateGmailAlias(userId, strategy);
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Failed to create Gmail alias:', error);
+    res.status(400).json({ error: error.message || 'Failed to create Gmail alias' });
+  }
+});
+
+router.get('/public/aliases/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const aliases = getUserAliases(userId);
+    
+    res.json({ aliases });
+  } catch (error) {
+    console.error('Failed to fetch Gmail aliases:', error);
+    res.status(400).json({ error: error.message || 'Failed to fetch Gmail aliases' });
+  }
+});
+
+router.get('/public/emails/:alias', async (req, res) => {
+  try {
+    const { alias } = req.params;
+    const userId = req.query.userId || `anon_${uuidv4()}`;
+    
+    const emails = await fetchGmailEmails(userId, alias);
+    
+    res.json({ emails });
+  } catch (error) {
+    console.error('Failed to fetch emails:', error);
+    res.status(400).json({ error: error.message || 'Failed to fetch emails' });
+  }
+});
+
+router.post('/public/rotate', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
     
     const result = await rotateUserAlias(userId);
     
@@ -153,6 +214,30 @@ router.post('/admin/accounts-alt', async (req, res) => {
   } catch (error) {
     console.error('Failed to add Gmail account:', error);
     res.status(400).json({ error: error.message || 'Failed to add Gmail account' });
+  }
+});
+
+// Verify a Gmail API credential
+router.post('/admin/verify-credential', async (req, res) => {
+  try {
+    // Check admin passphrase
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const { credentialId } = req.body;
+    
+    if (!credentialId) {
+      return res.status(400).json({ error: 'Credential ID is required' });
+    }
+    
+    const result = await verifyCredential(credentialId);
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Failed to verify credential:', error);
+    res.status(400).json({ error: error.message || 'Failed to verify credential' });
   }
 });
 

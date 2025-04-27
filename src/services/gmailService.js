@@ -78,6 +78,7 @@ function getNextAvailableCredential() {
     .sort((a, b) => a.usageCount - b.usageCount);
   
   if (activeCredentials.length === 0) {
+    console.error('No active Gmail credentials available');
     return null;
   }
   
@@ -172,6 +173,7 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
   const account = getNextAvailableAccount();
   
   if (!account) {
+    console.error('No Gmail accounts available. Current accounts:', [...gmailAccountsStore.keys()]);
     throw new Error('No Gmail accounts available');
   }
   
@@ -188,10 +190,12 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
   });
   
   // Add alias to user's list
-  if (!userAliasMap.has(userId)) {
-    userAliasMap.set(userId, []);
+  if (userId) {
+    if (!userAliasMap.has(userId)) {
+      userAliasMap.set(userId, []);
+    }
+    userAliasMap.get(userId).push(alias);
   }
-  userAliasMap.get(userId).push(alias);
   
   // Add alias to account
   account.aliases.push(alias);
@@ -243,8 +247,8 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   aliasMapping.lastAccessed = Date.now();
   aliasToAccountMap.set(aliasEmail, aliasMapping);
   
-  // Check if user owns this alias
-  if (!userAliasMap.has(userId) || !userAliasMap.get(userId).includes(aliasEmail)) {
+  // Check if user owns this alias (skip for null userId)
+  if (userId && userAliasMap.has(userId) && !userAliasMap.get(userId).includes(aliasEmail)) {
     throw new Error('Unauthorized access to alias');
   }
   
@@ -575,6 +579,40 @@ export async function getGmailCredentials() {
     ...cred,
     clientSecret: '***********' // Don't return the actual secrets
   }));
+}
+
+// Verify a credential
+export async function verifyCredential(credentialId) {
+  const credential = gmailCredentialsStore.get(credentialId);
+  
+  if (!credential) {
+    throw new Error('Credential not found');
+  }
+  
+  try {
+    // Create OAuth client with this credential
+    const oauth2Client = new google.auth.OAuth2(
+      credential.clientId,
+      credential.clientSecret,
+      credential.redirectUri
+    );
+    
+    // Get the auth URL to verify the credentials are valid
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: GMAIL_SCOPES,
+      prompt: 'consent' // Force to get refresh token
+    });
+    
+    // If we can generate an auth URL, the credentials are valid
+    return {
+      valid: true,
+      authUrl: authUrl
+    };
+  } catch (error) {
+    console.error('Credential verification failed:', error);
+    throw new Error(`Credential verification failed: ${error.message}`);
+  }
 }
 
 // Setup periodic cleanup task

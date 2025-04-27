@@ -108,6 +108,32 @@ app.get('/health', async (req, res) => {
   }
 });
 
+// Debug route to log all registered routes
+app.get('/debug/routes', (req, res) => {
+  const routes = [];
+  app._router.stack.forEach(middleware => {
+    if (middleware.route) {
+      // Routes registered directly on the app
+      routes.push({
+        path: middleware.route.path,
+        methods: Object.keys(middleware.route.methods)
+      });
+    } else if (middleware.name === 'router') {
+      // Routes inside a router
+      middleware.handle.stack.forEach(handler => {
+        if (handler.route) {
+          const path = handler.route.path;
+          routes.push({
+            path: middleware.regexp ? `${middleware.regexp}${path}` : path,
+            methods: Object.keys(handler.route.methods)
+          });
+        }
+      });
+    }
+  });
+  res.json(routes);
+});
+
 // Routes
 app.use('/auth', authRoutes);
 app.use('/emails', emailRoutes);
@@ -120,6 +146,22 @@ app.use('/gmail', gmailRoutes); // Add Gmail routes
 
 // Handle preflight requests for /admin/all
 app.options('/emails/admin/all', cors());
+
+// Print routes for debugging
+console.log('Registered routes:');
+const printRoutes = (stack, basePath = '') => {
+  stack.forEach(r => {
+    if (r.route) {
+      const methods = Object.keys(r.route.methods).join(', ').toUpperCase();
+      console.log(`${methods} ${basePath}${r.route.path}`);
+    } else if (r.name === 'router' && r.handle && r.handle.stack) {
+      const routerPath = r.regexp.toString().replace('\\/?(?=\\/|$)', '').replace(/^\\\//, '/').replace(/\\\//g, '/');
+      const path = routerPath.replace(/\(\?:\(\[\^\\\/\]\+\?\)\)/g, ':param');
+      printRoutes(r.handle.stack, path);
+    }
+  });
+};
+printRoutes(app._router.stack);
 
 // Schedule cleanup
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours

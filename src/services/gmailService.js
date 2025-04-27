@@ -8,6 +8,7 @@ const aliasToAccountMap = new Map(); // Maps email aliases to parent Gmail accou
 const userAliasMap = new Map(); // Maps users to their assigned aliases
 const emailCache = new Map(); // Cache for fetched emails
 const gmailCredentialsStore = new Map(); // Stores Gmail API credentials
+const accountCredentialMap = new Map(); // NEW: Maps Gmail accounts to the credential used to create them
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
@@ -54,6 +55,7 @@ function getOAuthClient(specificCredential = null) {
     credential = getNextAvailableCredential();
     
     if (!credential) {
+      console.log('No credentials available in store, using environment variables');
       // Fallback to environment variables if no credentials in store
       return new google.auth.OAuth2(
         process.env.GMAIL_CLIENT_ID,
@@ -72,6 +74,9 @@ function getOAuthClient(specificCredential = null) {
 
 // Get the next available Gmail credential using round-robin with status check
 function getNextAvailableCredential() {
+  // Log the current credentials state for debugging
+  console.log(`Credential store status: ${gmailCredentialsStore.size} credentials available`);
+  
   // Get all active credentials
   const activeCredentials = [...gmailCredentialsStore.values()]
     .filter(cred => cred.active)
@@ -84,6 +89,7 @@ function getNextAvailableCredential() {
   
   // Get the least used credential
   const credential = activeCredentials[0];
+  console.log(`Using credential ${credential.id} with ${credential.usageCount} previous uses`);
   
   // Update usage stats
   credential.usageCount += 1;
@@ -95,9 +101,11 @@ function getNextAvailableCredential() {
 
 // Gmail Account Management
 export async function addGmailAccount(code) {
-  const oauth2Client = getOAuthClient();
+  const credential = getNextAvailableCredential();
+  const oauth2Client = getOAuthClient(credential);
   
   try {
+    console.log('Exchanging authorization code for tokens...');
     // Exchange authorization code for tokens
     const { tokens } = await oauth2Client.getToken(code);
     
@@ -109,21 +117,48 @@ export async function addGmailAccount(code) {
     const profile = await gmail.users.getProfile({ userId: 'me' });
     
     const email = profile.data.emailAddress;
+    console.log(`Successfully obtained profile for email: ${email}`);
     
-    // Store account in memory with encrypted refresh token
-    gmailAccountsStore.set(email, {
-      email,
-      refreshToken: tokens.refresh_token ? encrypt(tokens.refresh_token) : null,
-      accessToken: tokens.access_token,
-      expiresAt: Date.now() + (tokens.expires_in * 1000),
-      quotaUsed: 0,
-      lastUsed: Date.now(),
-      aliases: [],
-      status: 'active'
-    });
+    // Store the credential ID used to create this account
+    if (credential) {
+      accountCredentialMap.set(email, credential.id);
+      console.log(`Account ${email} is mapped to credential ID ${credential.id}`);
+    }
     
-    // Start polling for this account
-    schedulePolling(email);
+    // Check if this account already exists
+    if (gmailAccountsStore.has(email)) {
+      console.log(`Account ${email} already exists, updating tokens`);
+      const existingAccount = gmailAccountsStore.get(email);
+      existingAccount.accessToken = tokens.access_token;
+      existingAccount.expiresAt = Date.now() + (tokens.expires_in * 1000);
+      if (tokens.refresh_token) {
+        existingAccount.refreshToken = encrypt(tokens.refresh_token);
+      }
+      existingAccount.status = 'active'; // Ensure the account is active
+      existingAccount.lastUsed = Date.now();
+      gmailAccountsStore.set(email, existingAccount);
+    } else {
+      console.log(`Adding new Gmail account: ${email}`);
+      // Store account in memory with encrypted refresh token
+      gmailAccountsStore.set(email, {
+        email,
+        refreshToken: tokens.refresh_token ? encrypt(tokens.refresh_token) : null,
+        accessToken: tokens.access_token,
+        expiresAt: Date.now() + (tokens.expires_in * 1000),
+        quotaUsed: 0,
+        lastUsed: Date.now(),
+        aliases: [],
+        status: 'active'
+      });
+    }
+    
+    // Start polling for this account if it's new
+    if (!gmailAccountsStore.has(email)) {
+      schedulePolling(email);
+    }
+    
+    // Log all accounts for debugging
+    console.log('Current Gmail accounts:', [...gmailAccountsStore.keys()]);
     
     return { email };
   } catch (error) {
@@ -134,6 +169,7 @@ export async function addGmailAccount(code) {
 
 // Get or refresh access token
 export async function getValidAccessToken(accountEmail) {
+  console.log(`Getting valid access token for ${accountEmail}...`);
   const account = gmailAccountsStore.get(accountEmail);
   
   if (!account) {
@@ -142,12 +178,31 @@ export async function getValidAccessToken(accountEmail) {
   
   // Check if token is still valid
   if (account.accessToken && account.expiresAt > Date.now()) {
+    console.log('Using existing valid access token');
     return account.accessToken;
   }
   
   // Refresh the token
   try {
-    const oauth2Client = getOAuthClient();
+    console.log('Refreshing access token...');
+    
+    // Get the credential ID that was used to create this account
+    const credentialId = accountCredentialMap.get(accountEmail);
+    let oauth2Client;
+    
+    if (credentialId && gmailCredentialsStore.has(credentialId)) {
+      const credential = gmailCredentialsStore.get(credentialId);
+      console.log(`Using specific credential ID ${credentialId} for account ${accountEmail}`);
+      oauth2Client = getOAuthClient(credential);
+    } else {
+      console.log(`No specific credential found for ${accountEmail}, using default OAuth client`);
+      oauth2Client = getOAuthClient();
+    }
+    
+    if (!account.refreshToken) {
+      throw new Error(`No refresh token available for ${accountEmail}`);
+    }
+    
     const refreshToken = decrypt(account.refreshToken);
     
     oauth2Client.setCredentials({ refresh_token: refreshToken });
@@ -158,10 +213,16 @@ export async function getValidAccessToken(accountEmail) {
     account.expiresAt = Date.now() + (credentials.expires_in * 1000);
     gmailAccountsStore.set(accountEmail, account);
     
+    console.log('Token refreshed successfully');
     return account.accessToken;
   } catch (error) {
-    console.error('Failed to refresh access token:', error);
-    account.status = 'error';
+    console.error(`Failed to refresh access token for ${accountEmail}:`, error);
+    account.status = error.message.includes('quota') || error.message.includes('rate limit') 
+      ? 'rate-limited' 
+      : error.message.includes('auth') || error.message.includes('token')
+        ? 'auth-error'
+        : 'error';
+    
     gmailAccountsStore.set(accountEmail, account);
     throw new Error('Failed to refresh access token');
   }
@@ -169,7 +230,7 @@ export async function getValidAccessToken(accountEmail) {
 
 // Alias Generation
 export async function generateGmailAlias(userId, strategy = 'dot') {
-  // Get next available account
+  // Get next available account using load balancing
   const account = getNextAvailableAccount();
   
   if (!account) {
@@ -177,10 +238,14 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
     throw new Error('No Gmail accounts available');
   }
   
+  console.log(`Generating ${strategy} alias using account: ${account.email}`);
+  
   // Generate unique alias based on strategy
   const alias = strategy === 'dot' 
     ? generateDotAlias(account.email)
     : generatePlusAlias(account.email);
+  
+  console.log(`Generated alias: ${alias}`);
   
   // Map alias to account and user
   aliasToAccountMap.set(alias, {
@@ -189,13 +254,14 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
     lastAccessed: Date.now()
   });
   
-  // Add alias to user's list
-  if (userId) {
-    if (!userAliasMap.has(userId)) {
-      userAliasMap.set(userId, []);
-    }
-    userAliasMap.get(userId).push(alias);
+  // Add alias to user's list (ensure userId exists for anonymous users)
+  const actualUserId = userId || `anon_${uuidv4()}`; 
+  console.log(`Mapping alias to user: ${actualUserId}`);
+  
+  if (!userAliasMap.has(actualUserId)) {
+    userAliasMap.set(actualUserId, []);
   }
+  userAliasMap.get(actualUserId).push(alias);
   
   // Add alias to account
   account.aliases.push(alias);
@@ -236,6 +302,8 @@ function generatePlusAlias(email) {
 
 // Email Fetching
 export async function fetchGmailEmails(userId, aliasEmail) {
+  console.log(`Fetching emails for ${aliasEmail}, requested by user ${userId || 'anonymous'}`);
+  
   // Get alias mapping
   const aliasMapping = aliasToAccountMap.get(aliasEmail);
   
@@ -268,13 +336,29 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   }
   
   // Get account for this alias
-  const account = gmailAccountsStore.get(aliasMapping.parentAccount);
+  const parentAccount = aliasMapping.parentAccount;
+  const account = gmailAccountsStore.get(parentAccount);
   
-  if (!account || account.status !== 'active') {
+  if (!account) {
+    console.error(`Parent account ${parentAccount} not found for alias ${aliasEmail}`);
     throw new Error('Gmail account unavailable');
   }
   
+  if (account.status !== 'active') {
+    console.error(`Account ${parentAccount} is not active. Current status: ${account.status}`);
+    
+    // Auto-recovery: Try to reactivate account if it's not in auth-error state
+    if (account.status !== 'auth-error') {
+      console.log(`Attempting to reactivate account ${parentAccount}`);
+      account.status = 'active';
+      gmailAccountsStore.set(parentAccount, account);
+    } else {
+      throw new Error('Gmail account unavailable');
+    }
+  }
+  
   // Get cached emails first
+  console.log(`Looking for cached emails for alias ${aliasEmail}`);
   const cachedEmails = [];
   for (const [key, email] of emailCache.entries()) {
     if (key.startsWith(`${aliasEmail}:`)) {
@@ -283,6 +367,7 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   }
   
   // Return cached emails sorted by date (newest first)
+  console.log(`Found ${cachedEmails.length} cached emails for ${aliasEmail}`);
   return cachedEmails.sort((a, b) => 
     new Date(b.internalDate) - new Date(a.internalDate)
   );
@@ -293,11 +378,13 @@ async function pollForNewEmails(accountEmail) {
   const account = gmailAccountsStore.get(accountEmail);
   
   if (!account || account.status !== 'active' || account.aliases.length === 0) {
+    console.log(`Skipping polling for ${accountEmail}: inactive or no aliases`);
     return;
   }
   
   try {
     // Get fresh access token
+    console.log(`Polling for new emails for account ${accountEmail}...`);
     const accessToken = await getValidAccessToken(accountEmail);
     
     // Initialize Gmail API client
@@ -319,6 +406,7 @@ async function pollForNewEmails(accountEmail) {
         });
         
         const messages = response.data.messages || [];
+        console.log(`Found ${messages.length} new messages for alias ${alias}`);
         
         // Fetch full message details for each message
         for (const message of messages) {
@@ -370,6 +458,7 @@ function schedulePolling(accountEmail) {
   const account = gmailAccountsStore.get(accountEmail);
   
   if (!account || account.status !== 'active') {
+    console.log(`Not scheduling polling for inactive account: ${accountEmail}`);
     return;
   }
   
@@ -382,6 +471,8 @@ function schedulePolling(accountEmail) {
   } else if (account.aliases.length > 5) {
     interval = POLLING_INTERVALS.medium;
   }
+  
+  console.log(`Scheduling polling for ${accountEmail} with interval ${interval}ms`);
   
   // Schedule next poll
   setTimeout(() => {
@@ -473,7 +564,9 @@ function addToEmailCache(key, email) {
 
 // Alias Management
 export function cleanupInactiveAliases() {
+  console.log('Running alias cleanup...');
   const now = Date.now();
+  let removedCount = 0;
   
   for (const [alias, data] of aliasToAccountMap.entries()) {
     if (now - data.lastAccessed > ALIAS_TTL) {
@@ -494,44 +587,82 @@ export function cleanupInactiveAliases() {
           break;
         }
       }
+      
+      removedCount++;
     }
+  }
+  
+  if (removedCount > 0) {
+    console.log(`Cleaned up ${removedCount} inactive aliases`);
   }
 }
 
-// Load Balancing
+// Load Balancing - This is the critical function that needs fixing
 function getNextAvailableAccount() {
+  // Print all accounts and their status for debugging
+  console.log('Available Gmail accounts:');
+  for (const [email, account] of gmailAccountsStore.entries()) {
+    console.log(`- ${email}: status=${account.status}, aliases=${account.aliases.length}, quotaUsed=${account.quotaUsed}`);
+  }
+
   // Get all active accounts
   const availableAccounts = [...gmailAccountsStore.values()]
-    .filter(account => account.status === 'active')
-    .sort((a, b) => {
-      // Primary sort: quota usage
-      if (a.quotaUsed !== b.quotaUsed) {
-        return a.quotaUsed - b.quotaUsed;
+    .filter(account => {
+      // Consider auth-error accounts as unavailable
+      if (account.status === 'auth-error') {
+        return false;
       }
-      // Secondary sort: number of aliases
+      
+      // Auto-fix accounts in error states if they're not auth errors
+      if (account.status !== 'active') {
+        console.log(`Auto-recovering account ${account.email} from ${account.status} status`);
+        account.status = 'active';
+        gmailAccountsStore.set(account.email, account);
+      }
+      
+      return true;
+    })
+    // Use a fair load balancing algorithm
+    .sort((a, b) => {
+      // Primary: Sort by active status (active accounts first)
+      if (a.status === 'active' && b.status !== 'active') return -1;
+      if (a.status !== 'active' && b.status === 'active') return 1;
+      
+      // Secondary: Sort by number of aliases (fewer aliases first)
       if (a.aliases.length !== b.aliases.length) {
         return a.aliases.length - b.aliases.length;
       }
-      // Tertiary sort: last used timestamp
+      
+      // Tertiary: Sort by quota usage (less usage first)
+      if (a.quotaUsed !== b.quotaUsed) {
+        return a.quotaUsed - b.quotaUsed;
+      }
+      
+      // Final tiebreaker: Sort by last used timestamp (least recently used first)
       return a.lastUsed - b.lastUsed;
     });
   
   if (availableAccounts.length === 0) {
+    console.error('No available Gmail accounts');
     return null;
   }
   
-  return availableAccounts[0];
+  const selectedAccount = availableAccounts[0];
+  console.log(`Selected account for new alias: ${selectedAccount.email}`);
+  
+  return selectedAccount;
 }
 
 // User Alias Management
 export function getUserAliases(userId) {
-  return userAliasMap.get(userId) || [];
+  if (!userId) return [];
+  
+  const aliases = userAliasMap.get(userId) || [];
+  console.log(`User ${userId} has ${aliases.length} aliases`);
+  return aliases;
 }
 
 export function rotateUserAlias(userId) {
-  // Delete current alias
-  const currentAliases = userAliasMap.get(userId) || [];
-  
   // Generate a new alias for the user
   return generateGmailAlias(userId);
 }
@@ -689,5 +820,6 @@ export const stores = {
   aliasToAccountMap,
   userAliasMap,
   emailCache,
-  gmailCredentialsStore
+  gmailCredentialsStore,
+  accountCredentialMap  // Export the new map
 };

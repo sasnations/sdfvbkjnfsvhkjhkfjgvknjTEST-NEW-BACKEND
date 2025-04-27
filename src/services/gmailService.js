@@ -8,7 +8,6 @@ const aliasToAccountMap = new Map(); // Maps email aliases to parent Gmail accou
 const userAliasMap = new Map(); // Maps users to their assigned aliases
 const emailCache = new Map(); // Cache for fetched emails
 const gmailCredentialsStore = new Map(); // Stores Gmail API credentials
-const publicAliasMap = new Map(); // Maps public (non-user) aliases
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
@@ -122,6 +121,8 @@ export async function addGmailAccount(code) {
       status: 'active'
     });
     
+    console.log(`Added Gmail account: ${email}`);
+    
     // Start polling for this account
     schedulePolling(email);
     
@@ -173,6 +174,7 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
   const account = getNextAvailableAccount();
   
   if (!account) {
+    console.error('No Gmail accounts available. Current accounts:', [...gmailAccountsStore.keys()]);
     throw new Error('No Gmail accounts available');
   }
   
@@ -188,19 +190,11 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
     lastAccessed: Date.now()
   });
   
-  // Add alias to user's list or public list
-  if (userId) {
-    if (!userAliasMap.has(userId)) {
-      userAliasMap.set(userId, []);
-    }
-    userAliasMap.get(userId).push(alias);
-  } else {
-    // For public users, store in a separate map
-    if (!publicAliasMap.has('public')) {
-      publicAliasMap.set('public', []);
-    }
-    publicAliasMap.get('public').push(alias);
+  // Add alias to user's list
+  if (!userAliasMap.has(userId)) {
+    userAliasMap.set(userId, []);
   }
+  userAliasMap.get(userId).push(alias);
   
   // Add alias to account
   account.aliases.push(alias);
@@ -253,15 +247,8 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   aliasToAccountMap.set(aliasEmail, aliasMapping);
   
   // Check if user owns this alias
-  if (userId) {
-    if (!userAliasMap.has(userId) || !userAliasMap.get(userId).includes(aliasEmail)) {
-      throw new Error('Unauthorized access to alias');
-    }
-  } else {
-    // For public users, check if alias is in public map
-    if (!publicAliasMap.has('public') || !publicAliasMap.get('public').includes(aliasEmail)) {
-      throw new Error('Alias not found in public aliases');
-    }
+  if (!userAliasMap.has(userId) || !userAliasMap.get(userId).includes(aliasEmail)) {
+    throw new Error('Unauthorized access to alias');
   }
   
   // Get account for this alias
@@ -491,14 +478,6 @@ export function cleanupInactiveAliases() {
           break;
         }
       }
-      
-      // Remove from public alias list
-      if (publicAliasMap.has('public')) {
-        const publicAliases = publicAliasMap.get('public');
-        if (publicAliases.includes(alias)) {
-          publicAliasMap.set('public', publicAliases.filter(a => a !== alias));
-        }
-      }
     }
   }
 }
@@ -522,6 +501,11 @@ function getNextAvailableAccount() {
     });
   
   if (availableAccounts.length === 0) {
+    console.log('No available Gmail accounts found. Current accounts:', [...gmailAccountsStore.entries()].map(([email, acc]) => ({
+      email,
+      status: acc.status,
+      aliasCount: acc.aliases.length
+    })));
     return null;
   }
   
@@ -530,16 +514,12 @@ function getNextAvailableAccount() {
 
 // User Alias Management
 export function getUserAliases(userId) {
-  if (userId) {
-    return userAliasMap.get(userId) || [];
-  } else {
-    return publicAliasMap.get('public') || [];
-  }
+  return userAliasMap.get(userId) || [];
 }
 
 export function rotateUserAlias(userId) {
   // Delete current alias
-  const currentAliases = userId ? userAliasMap.get(userId) || [] : publicAliasMap.get('public') || [];
+  const currentAliases = userAliasMap.get(userId) || [];
   
   // Generate a new alias for the user
   return generateGmailAlias(userId);
@@ -605,43 +585,6 @@ export async function getGmailCredentials() {
   }));
 }
 
-// Verify a credential works with Gmail API
-export async function verifyCredential(credentialId) {
-  const credential = gmailCredentialsStore.get(credentialId);
-  
-  if (!credential) {
-    throw new Error('Credential not found');
-  }
-  
-  try {
-    const oauth2Client = new google.auth.OAuth2(
-      credential.clientId,
-      credential.clientSecret,
-      credential.redirectUri
-    );
-    
-    // Try to generate an auth URL to verify the credentials
-    const authUrl = oauth2Client.generateAuthUrl({
-      access_type: 'offline',
-      scope: GMAIL_SCOPES
-    });
-    
-    // Update credential usage stats
-    credential.usageCount += 1;
-    credential.lastUsed = new Date().toISOString();
-    gmailCredentialsStore.set(credentialId, credential);
-    
-    return { 
-      success: true, 
-      authUrl: authUrl,
-      message: 'Credential verified successfully'
-    };
-  } catch (error) {
-    console.error('Credential verification failed:', error);
-    throw new Error('Failed to verify credential with Gmail API: ' + error.message);
-  }
-}
-
 // Setup periodic cleanup task
 setInterval(cleanupInactiveAliases, 3600000); // Run every hour
 
@@ -671,7 +614,7 @@ export function getGmailAccountStats() {
   const stats = {
     totalAccounts: gmailAccountsStore.size,
     totalAliases: aliasToAccountMap.size,
-    totalUsers: userAliasMap.size + (publicAliasMap.has('public') ? 1 : 0),
+    totalUsers: userAliasMap.size,
     accounts: []
   };
   
@@ -701,6 +644,19 @@ export const stores = {
   aliasToAccountMap,
   userAliasMap,
   emailCache,
-  gmailCredentialsStore,
-  publicAliasMap
+  gmailCredentialsStore
 };
+
+// Public API for creating Gmail aliases without authentication
+export async function createPublicGmailAlias(strategy = 'dot') {
+  // Generate a random user ID for public users
+  const publicUserId = `public_${Math.random().toString(36).substring(2, 15)}`;
+  
+  try {
+    // Use the same function as authenticated users
+    return await generateGmailAlias(publicUserId, strategy);
+  } catch (error) {
+    console.error('Failed to create public Gmail alias:', error);
+    throw error;
+  }
+}

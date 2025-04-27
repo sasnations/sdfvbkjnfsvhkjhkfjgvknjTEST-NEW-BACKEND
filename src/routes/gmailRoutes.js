@@ -15,24 +15,62 @@ import {
   updateGmailCredential,
   deleteGmailCredential,
   updateGmailCredentialStatus,
-  createPublicGmailAlias
+  verifyCredential
 } from '../services/gmailService.js';
 
 const router = express.Router();
 
 // ==================== Public Routes ====================
 
-// Create a new Gmail alias without authentication
+// Create a new Gmail alias (public)
 router.post('/public/create', async (req, res) => {
   try {
     const { strategy } = req.body; // 'dot' or 'plus'
     
-    const result = await createPublicGmailAlias(strategy);
+    const result = await generateGmailAlias(null, strategy);
     
     res.json(result);
   } catch (error) {
-    console.error('Failed to create public Gmail alias:', error);
+    console.error('Failed to create Gmail alias:', error);
     res.status(400).json({ error: error.message || 'Failed to create Gmail alias' });
+  }
+});
+
+// Get all Gmail aliases for the public user
+router.get('/public/aliases', async (req, res) => {
+  try {
+    const aliases = getUserAliases(null);
+    
+    res.json({ aliases });
+  } catch (error) {
+    console.error('Failed to fetch Gmail aliases:', error);
+    res.status(400).json({ error: error.message || 'Failed to fetch Gmail aliases' });
+  }
+});
+
+// Fetch emails for a specific alias (public)
+router.get('/public/emails/:alias', async (req, res) => {
+  try {
+    const { alias } = req.params;
+    
+    const emails = await fetchGmailEmails(null, alias);
+    
+    res.json({ emails });
+  } catch (error) {
+    console.error('Failed to fetch emails:', error);
+    res.status(400).json({ error: error.message || 'Failed to fetch emails' });
+  }
+});
+
+// Rotate to a new Gmail alias (public)
+router.post('/public/rotate', async (req, res) => {
+  try {
+    const result = await rotateUserAlias(null);
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Failed to rotate Gmail alias:', error);
+    res.status(400).json({ error: error.message || 'Failed to rotate Gmail alias' });
   }
 });
 
@@ -329,23 +367,27 @@ router.patch('/admin/credentials/:id/status', async (req, res) => {
   }
 });
 
-// Handle OAuth callback
-router.get('/oauth/callback', async (req, res) => {
+// Verify a Gmail API credential
+router.post('/admin/verify-credential', async (req, res) => {
   try {
-    const { code } = req.query;
-    
-    if (!code) {
-      return res.status(400).send('Authorization code is missing');
+    // Check admin passphrase
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
+      return res.status(403).json({ error: 'Unauthorized' });
     }
     
-    // Add the Gmail account
-    const result = await addGmailAccount(code);
+    const { credentialId } = req.body;
     
-    // Redirect to admin page with success message
-    res.redirect(`/adminonlygmail?success=true&email=${encodeURIComponent(result.email)}`);
+    if (!credentialId) {
+      return res.status(400).json({ error: 'Credential ID is required' });
+    }
+    
+    const result = await verifyCredential(credentialId);
+    
+    res.json({ success: true, message: 'Credential verified successfully', result });
   } catch (error) {
-    console.error('OAuth callback error:', error);
-    res.redirect(`/adminonlygmail?error=${encodeURIComponent(error.message)}`);
+    console.error('Failed to verify Gmail credential:', error);
+    res.status(400).json({ error: error.message || 'Failed to verify Gmail credential' });
   }
 });
 

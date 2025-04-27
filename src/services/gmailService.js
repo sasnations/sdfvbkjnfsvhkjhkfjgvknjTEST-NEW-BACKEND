@@ -174,7 +174,11 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
   const account = getNextAvailableAccount();
   
   if (!account) {
-    console.error('No Gmail accounts available. Current accounts:', [...gmailAccountsStore.keys()]);
+    console.error('No Gmail accounts available. Current accounts:', [...gmailAccountsStore.entries()].map(([email, acc]) => ({
+      email,
+      status: acc.status,
+      aliasCount: acc.aliases.length
+    })));
     throw new Error('No Gmail accounts available');
   }
   
@@ -696,5 +700,3 @@ export async function createPublicGmailAlias(strategy = 'dot') {
     throw error;
   }
 }
-
-export { getGmailCredentials }

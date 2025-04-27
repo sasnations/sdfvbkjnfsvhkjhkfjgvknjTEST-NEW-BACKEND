@@ -8,7 +8,7 @@ const aliasToAccountMap = new Map(); // Maps email aliases to parent Gmail accou
 const userAliasMap = new Map(); // Maps users to their assigned aliases
 const emailCache = new Map(); // Cache for fetched emails
 const gmailCredentialsStore = new Map(); // Stores Gmail API credentials
-const accountCredentialMap = new Map(); // NEW: Maps Gmail accounts to the credential used to create them
+const accountCredentialMap = new Map(); // Maps Gmail accounts to the credential used to create them
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
@@ -55,8 +55,8 @@ function getOAuthClient(specificCredential = null) {
     credential = getNextAvailableCredential();
     
     if (!credential) {
-      console.log('No credentials available in store, using environment variables');
       // Fallback to environment variables if no credentials in store
+      console.log('No credentials available in store, using environment variables');
       return new google.auth.OAuth2(
         process.env.GMAIL_CLIENT_ID,
         process.env.GMAIL_CLIENT_SECRET,
@@ -110,7 +110,7 @@ export async function addGmailAccount(code) {
     const { tokens } = await oauth2Client.getToken(code);
     
     // Set credentials to get user info
-    oauth2Client.setCredentials(tokens);
+    oauth2Client.setCredentials({ access_token: tokens.access_token });
     
     // Get Gmail profile to identify the email
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });

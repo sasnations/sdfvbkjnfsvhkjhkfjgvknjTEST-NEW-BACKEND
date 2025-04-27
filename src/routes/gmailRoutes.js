@@ -217,6 +217,36 @@ router.post('/admin/accounts-alt', async (req, res) => {
   }
 });
 
+// NEW: GET handler for OAuth callback
+router.get('/admin/accounts-alt', async (req, res) => {
+  try {
+    // Get the code from query parameters
+    const { code } = req.query;
+    
+    if (!code) {
+      console.error('OAuth callback received without code');
+      return res.status(400).send('Authorization code is required');
+    }
+    
+    console.log('Received OAuth callback with code:', code);
+    
+    try {
+      // Process the code
+      const result = await addGmailAccount(code.toString());
+      console.log('Successfully added Gmail account:', result.email);
+      
+      // Redirect back to the admin page
+      res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?success=true&email=${encodeURIComponent(result.email)}`);
+    } catch (error) {
+      console.error('Failed to add Gmail account in callback:', error);
+      res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?error=${encodeURIComponent('Failed to add Gmail account')}`);
+    }
+  } catch (error) {
+    console.error('OAuth callback general error:', error);
+    res.status(500).send('Internal server error processing OAuth callback');
+  }
+});
+
 // Verify a Gmail API credential
 router.post('/admin/verify-credential', async (req, res) => {
   try {
@@ -237,6 +267,30 @@ router.post('/admin/verify-credential', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to verify credential:', error);
+    res.status(400).json({ error: error.message || 'Failed to verify credential' });
+  }
+});
+
+// NEW: GET handler for credential verification (fallback)
+router.get('/admin/verify-credential', async (req, res) => {
+  try {
+    // Check admin passphrase
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const { credentialId } = req.query;
+    
+    if (!credentialId) {
+      return res.status(400).json({ error: 'Credential ID is required' });
+    }
+    
+    const result = await verifyCredential(credentialId.toString());
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Failed to verify credential (GET):', error);
     res.status(400).json({ error: error.message || 'Failed to verify credential' });
   }
 });

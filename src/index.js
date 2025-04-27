@@ -15,6 +15,7 @@ import messageRoutes from './routes/messages.js';
 import blogRoutes from './routes/blog.js';
 import monitorRoutes from './routes/monitor.js';
 import gmailRoutes from './routes/gmailRoutes.js'; // Added Gmail routes
+import debugRoutes from './routes/debug.js'; // Added Debug routes
 import nodemailer from 'nodemailer';
 
 dotenv.config();
@@ -143,6 +144,7 @@ app.use('/messages', messageRoutes);
 app.use('/blog', blogRoutes);
 app.use('/monitor', monitorRoutes);
 app.use('/gmail', gmailRoutes); // Add Gmail routes
+app.use('/debug', debugRoutes); // Add Debug routes
 
 // Handle preflight requests for /admin/all
 app.options('/emails/admin/all', cors());

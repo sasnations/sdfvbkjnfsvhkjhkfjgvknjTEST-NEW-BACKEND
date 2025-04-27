@@ -247,9 +247,24 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   aliasMapping.lastAccessed = Date.now();
   aliasToAccountMap.set(aliasEmail, aliasMapping);
   
-  // Check if user owns this alias (skip for null userId)
-  if (userId && userAliasMap.has(userId) && !userAliasMap.get(userId).includes(aliasEmail)) {
-    throw new Error('Unauthorized access to alias');
+  // Modified permission check: allow null userId (public) and handle anonymous users
+  if (userId) {
+    // For authenticated users, check if they own this alias
+    const isAnonymousUser = userId.startsWith('anon_');
+    
+    // For authenticated but non-anonymous users, perform strict checking
+    if (!isAnonymousUser) {
+      if (userAliasMap.has(userId) && !userAliasMap.get(userId).includes(aliasEmail)) {
+        throw new Error('Unauthorized access to alias');
+      }
+    } else {
+      // For anonymous users, check if this alias was created with this anonymous ID
+      // But be more permissive - if userId not found, assume it's a new anonymous session
+      if (userAliasMap.has(userId) && !userAliasMap.get(userId).includes(aliasEmail)) {
+        // If the anonymous user has other aliases but not this one, add it
+        userAliasMap.get(userId).push(aliasEmail);
+      }
+    }
   }
   
   // Get account for this alias

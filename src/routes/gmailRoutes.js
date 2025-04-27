@@ -14,72 +14,18 @@ import {
   addGmailCredential,
   updateGmailCredential,
   deleteGmailCredential,
-  updateGmailCredentialStatus,
-  verifyCredential
+  updateGmailCredentialStatus
 } from '../services/gmailService.js';
 
 const router = express.Router();
 
-// ==================== Public Routes ====================
-
-// Create a new Gmail alias (public)
-router.post('/public/create', async (req, res) => {
-  try {
-    const { strategy } = req.body; // 'dot' or 'plus'
-    
-    const result = await generateGmailAlias(null, strategy);
-    
-    res.json(result);
-  } catch (error) {
-    console.error('Failed to create Gmail alias:', error);
-    res.status(400).json({ error: error.message || 'Failed to create Gmail alias' });
-  }
-});
-
-// Get all Gmail aliases for the public user
-router.get('/public/aliases', async (req, res) => {
-  try {
-    const aliases = getUserAliases(null);
-    
-    res.json({ aliases });
-  } catch (error) {
-    console.error('Failed to fetch Gmail aliases:', error);
-    res.status(400).json({ error: error.message || 'Failed to fetch Gmail aliases' });
-  }
-});
-
-// Fetch emails for a specific alias (public)
-router.get('/public/emails/:alias', async (req, res) => {
-  try {
-    const { alias } = req.params;
-    
-    const emails = await fetchGmailEmails(null, alias);
-    
-    res.json({ emails });
-  } catch (error) {
-    console.error('Failed to fetch emails:', error);
-    res.status(400).json({ error: error.message || 'Failed to fetch emails' });
-  }
-});
-
-// Rotate to a new Gmail alias (public)
-router.post('/public/rotate', async (req, res) => {
-  try {
-    const result = await rotateUserAlias(null);
-    
-    res.json(result);
-  } catch (error) {
-    console.error('Failed to rotate Gmail alias:', error);
-    res.status(400).json({ error: error.message || 'Failed to rotate Gmail alias' });
-  }
-});
-
 // ==================== User Routes ====================
 
 // Create a new Gmail alias
-router.post('/create', authenticateToken, async (req, res) => {
+router.post('/create', async (req, res) => {
   try {
-    const userId = req.user.id;
+    // Allow both authenticated and unauthenticated users
+    const userId = req.user?.id || `anon_${uuidv4()}`;
     const { strategy } = req.body; // 'dot' or 'plus'
     
     const result = await generateGmailAlias(userId, strategy);
@@ -92,9 +38,10 @@ router.post('/create', authenticateToken, async (req, res) => {
 });
 
 // Get all Gmail aliases for the user
-router.get('/aliases', authenticateToken, async (req, res) => {
+router.get('/aliases', async (req, res) => {
   try {
-    const userId = req.user.id;
+    // Allow both authenticated and unauthenticated users
+    const userId = req.user?.id || req.query.userId || `anon_${uuidv4()}`;
     const aliases = getUserAliases(userId);
     
     res.json({ aliases });
@@ -105,9 +52,10 @@ router.get('/aliases', authenticateToken, async (req, res) => {
 });
 
 // Fetch emails for a specific alias
-router.get('/:alias/emails', authenticateToken, async (req, res) => {
+router.get('/:alias/emails', async (req, res) => {
   try {
-    const userId = req.user.id;
+    // Allow both authenticated and unauthenticated users
+    const userId = req.user?.id || req.query.userId || `anon_${uuidv4()}`;
     const { alias } = req.params;
     
     const emails = await fetchGmailEmails(userId, alias);
@@ -120,9 +68,10 @@ router.get('/:alias/emails', authenticateToken, async (req, res) => {
 });
 
 // Rotate to a new Gmail alias
-router.post('/rotate', authenticateToken, async (req, res) => {
+router.post('/rotate', async (req, res) => {
   try {
-    const userId = req.user.id;
+    // Allow both authenticated and unauthenticated users
+    const userId = req.user?.id || req.body.userId || `anon_${uuidv4()}`;
     
     const result = await rotateUserAlias(userId);
     
@@ -364,30 +313,6 @@ router.patch('/admin/credentials/:id/status', async (req, res) => {
   } catch (error) {
     console.error('Failed to update Gmail credential status:', error);
     res.status(400).json({ error: error.message || 'Failed to update Gmail credential status' });
-  }
-});
-
-// Verify a Gmail API credential
-router.post('/admin/verify-credential', async (req, res) => {
-  try {
-    // Check admin passphrase
-    const adminAccess = req.headers['admin-access'];
-    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    const { credentialId } = req.body;
-    
-    if (!credentialId) {
-      return res.status(400).json({ error: 'Credential ID is required' });
-    }
-    
-    const result = await verifyCredential(credentialId);
-    
-    res.json({ success: true, message: 'Credential verified successfully', result });
-  } catch (error) {
-    console.error('Failed to verify Gmail credential:', error);
-    res.status(400).json({ error: error.message || 'Failed to verify Gmail credential' });
   }
 });
 

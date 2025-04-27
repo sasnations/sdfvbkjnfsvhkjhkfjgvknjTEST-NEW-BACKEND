@@ -121,8 +121,6 @@ export async function addGmailAccount(code) {
       status: 'active'
     });
     
-    console.log(`Added Gmail account: ${email}`);
-    
     // Start polling for this account
     schedulePolling(email);
     
@@ -174,11 +172,6 @@ export async function generateGmailAlias(userId, strategy = 'dot') {
   const account = getNextAvailableAccount();
   
   if (!account) {
-    console.error('No Gmail accounts available. Current accounts:', [...gmailAccountsStore.entries()].map(([email, acc]) => ({
-      email,
-      status: acc.status,
-      aliasCount: acc.aliases.length
-    })));
     throw new Error('No Gmail accounts available');
   }
   
@@ -251,11 +244,8 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   aliasToAccountMap.set(aliasEmail, aliasMapping);
   
   // Check if user owns this alias
-  if (userId && !userAliasMap.has(userId) || (userId && !userAliasMap.get(userId).includes(aliasEmail))) {
-    // For public users (userId is null), we skip this check
-    if (userId !== null) {
-      throw new Error('Unauthorized access to alias');
-    }
+  if (!userAliasMap.has(userId) || !userAliasMap.get(userId).includes(aliasEmail)) {
+    throw new Error('Unauthorized access to alias');
   }
   
   // Get account for this alias
@@ -508,11 +498,6 @@ function getNextAvailableAccount() {
     });
   
   if (availableAccounts.length === 0) {
-    console.log('No available Gmail accounts found. Current accounts:', [...gmailAccountsStore.entries()].map(([email, acc]) => ({
-      email,
-      status: acc.status,
-      aliasCount: acc.aliases.length
-    })));
     return null;
   }
   
@@ -592,39 +577,6 @@ export async function getGmailCredentials() {
   }));
 }
 
-// Verify a credential by testing the connection
-export async function verifyCredential(credentialId) {
-  const credential = gmailCredentialsStore.get(credentialId);
-  
-  if (!credential) {
-    throw new Error('Credential not found');
-  }
-  
-  try {
-    // Create OAuth client with this credential
-    const oauth2Client = new google.auth.OAuth2(
-      credential.clientId,
-      credential.clientSecret,
-      credential.redirectUri
-    );
-    
-    // Get the auth URL to verify the credentials are valid
-    const authUrl = oauth2Client.generateAuthUrl({
-      access_type: 'offline',
-      scope: GMAIL_SCOPES
-    });
-    
-    // If we can generate an auth URL, the credentials are valid
-    return {
-      valid: true,
-      authUrl: authUrl
-    };
-  } catch (error) {
-    console.error('Credential verification failed:', error);
-    throw new Error(`Credential verification failed: ${error.message}`);
-  }
-}
-
 // Setup periodic cleanup task
 setInterval(cleanupInactiveAliases, 3600000); // Run every hour
 
@@ -686,17 +638,3 @@ export const stores = {
   emailCache,
   gmailCredentialsStore
 };
-
-// Public API for creating Gmail aliases without authentication
-export async function createPublicGmailAlias(strategy = 'dot') {
-  // Generate a random user ID for public users
-  const publicUserId = `public_${Math.random().toString(36).substring(2, 15)}`;
-  
-  try {
-    // Use the same function as authenticated users
-    return await generateGmailAlias(publicUserId, strategy);
-  } catch (error) {
-    console.error('Failed to create public Gmail alias:', error);
-    throw error;
-  }
-}

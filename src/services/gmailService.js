@@ -12,9 +12,9 @@ const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
 const ALIAS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds for in-memory cache
 const GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
 const POLLING_INTERVALS = {
-  high: 10000,    // 10 seconds
-  medium: 30000,  // 30 seconds
-  low: 60000      // 60 seconds
+  high: 5000,     // 5 seconds for high priority accounts
+  medium: 15000,  // 15 seconds for medium priority
+  low: 30000      // 30 seconds for low priority accounts
 };
 
 // Map to track active polling accounts
@@ -198,7 +198,7 @@ export async function addGmailAccount(code) {
   }
 }
 
-// Get or refresh access token
+// Get or refresh access token with enhanced error handling and recovery
 export async function getValidAccessToken(accountEmail) {
   console.log(`Getting valid access token for ${accountEmail}...`);
   
@@ -256,18 +256,38 @@ export async function getValidAccessToken(accountEmail) {
   } catch (error) {
     console.error(`Failed to refresh access token for ${accountEmail}:`, error);
     
-    // Update account status in database
-    const statusUpdate = error.message.includes('quota') || error.message.includes('rate limit') 
-      ? 'rate-limited' 
-      : error.message.includes('auth') || error.message.includes('token')
-        ? 'auth-error'
-        : 'error';
+    // Update account status in database with more detailed status
+    let statusUpdate = 'error';
+    if (error.message.includes('invalid_grant') || error.message.includes('unauthorized_client')) {
+      statusUpdate = 'auth-error';
+    } else if (error.message.includes('quota') || error.message.includes('rate limit')) {
+      statusUpdate = 'rate-limited';
+    } else if (error.message.includes('network') || error.message.includes('timeout')) {
+      statusUpdate = 'network-error';
+    }
     
     try {
       await pool.query(
         'UPDATE gmail_accounts SET status = ?, updated_at = NOW() WHERE email = ?',
         [statusUpdate, accountEmail]
       );
+      
+      // Attempt auto-recovery for certain types of errors
+      if (statusUpdate !== 'auth-error') {
+        // Schedule a retry after a delay
+        setTimeout(async () => {
+          try {
+            console.log(`Attempting auto-recovery for ${accountEmail}...`);
+            await pool.query(
+              'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE email = ?',
+              [accountEmail]
+            );
+          } catch (retryError) {
+            console.error(`Failed to auto-recover ${accountEmail}:`, retryError);
+          }
+        }, 15 * 60 * 1000); // Try to recover after 15 minutes
+      }
+      
     } catch (dbError) {
       console.error('Error updating account status:', dbError);
     }
@@ -276,14 +296,14 @@ export async function getValidAccessToken(accountEmail) {
   }
 }
 
-// Alias Generation
+// Alias Generation with improved reliability
 export async function generateGmailAlias(userId, strategy = 'dot') {
   // Get next available account using load balancing from database
   try {
     const account = await getNextAvailableAccount();
     
     if (!account) {
-      console.error('No Gmail accounts available.');
+      console.error('No Gmail accounts available. Active accounts:', [...activePollingAccounts]);
       throw new Error('No Gmail accounts available');
     }
     
@@ -364,7 +384,7 @@ function generatePlusAlias(email) {
   return `${username}+${tag}@${domain}`;
 }
 
-// Email Fetching
+// Email Fetching with improved caching and retrieval
 export async function fetchGmailEmails(userId, aliasEmail) {
   console.log(`Fetching emails for ${aliasEmail}, requested by user ${userId || 'anonymous'}`);
   
@@ -456,7 +476,7 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   }
 }
 
-// Email Polling (Background Task)
+// Email Polling (Background Task) with improved error handling and frequency
 async function pollForNewEmails(accountEmail) {
   try {
     // Get account from database
@@ -474,6 +494,18 @@ async function pollForNewEmails(accountEmail) {
     
     if (account.status !== 'active') {
       console.log(`Skipping polling for inactive account ${accountEmail} (status: ${account.status})`);
+      // Try to auto-recover non-auth-error accounts after some time
+      if (account.status !== 'auth-error') {
+        // Only attempt recovery if the account has been inactive for at least 10 minutes
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+        if (new Date(account.updated_at) < tenMinutesAgo) {
+          console.log(`Attempting to auto-recover account ${accountEmail}`);
+          await pool.query(
+            'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE id = ?',
+            [account.id]
+          );
+        }
+      }
       return;
     }
     
@@ -501,8 +533,8 @@ async function pollForNewEmails(accountEmail) {
     
     // Fetch emails for all aliases associated with this account
     for (const alias of accountAliases) {
-      // Build query to get recent emails sent to this alias
-      const query = `to:${alias} newer_than:10m`;
+      // Build query to get recent emails sent to this alias including spam/trash
+      const query = `to:${alias} newer_than:2m in:anywhere`; // Search everywhere, including spam
       
       try {
         // List messages matching query
@@ -587,13 +619,15 @@ function schedulePolling(accountEmail) {
       
       console.log(`Scheduling polling for ${accountEmail}`);
       
-      // Determine polling interval based on activity
-      let interval = POLLING_INTERVALS.low;
+      // Determine polling interval based on activity - use more frequent intervals
+      let interval = POLLING_INTERVALS.medium; // Default to medium priority
       
       if (accounts[0].alias_count > 10) {
         interval = POLLING_INTERVALS.high;
       } else if (accounts[0].alias_count > 5) {
         interval = POLLING_INTERVALS.medium;
+      } else {
+        interval = POLLING_INTERVALS.low;
       }
       
       console.log(`Using polling interval of ${interval}ms for ${accountEmail}`);
@@ -679,7 +713,7 @@ function processGmailMessage(message, recipientAlias) {
   };
 }
 
-// Cache Management
+// Cache Management with improved efficiency
 function addToEmailCache(key, email) {
   // If cache is at capacity, remove oldest entries
   if (emailCache.size >= MAX_CACHE_SIZE) {
@@ -732,14 +766,14 @@ export async function cleanupInactiveAliases() {
   }
 }
 
-// Load Balancing
+// Load Balancing with improved account selection
 async function getNextAvailableAccount() {
   try {
     // Get all available accounts with balancing strategy
     const [accounts] = await pool.query(`
       SELECT * 
       FROM gmail_accounts a
-      WHERE a.status = 'active' OR a.status = 'rate-limited'
+      WHERE a.status = 'active' OR (a.status = 'rate-limited' AND a.updated_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE))
       ORDER BY 
         CASE WHEN a.status = 'active' THEN 0 ELSE 1 END,  -- Active accounts first
         a.alias_count ASC,                                -- Accounts with fewer aliases
@@ -750,6 +784,32 @@ async function getNextAvailableAccount() {
     
     if (accounts.length === 0) {
       console.error('No available Gmail accounts');
+      
+      // Attempt to auto-recover accounts that haven't been updated in a while
+      const [recoveryResult] = await pool.query(`
+        UPDATE gmail_accounts 
+        SET status = 'active', updated_at = NOW() 
+        WHERE status != 'auth-error' 
+        AND updated_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)
+        LIMIT 3
+      `);
+      
+      if (recoveryResult.affectedRows > 0) {
+        console.log(`Auto-recovered ${recoveryResult.affectedRows} Gmail accounts`);
+        
+        // Try again after recovery
+        const [recoveredAccounts] = await pool.query(`
+          SELECT * FROM gmail_accounts
+          WHERE status = 'active'
+          ORDER BY alias_count ASC, quota_used ASC, last_used ASC
+          LIMIT 1
+        `);
+        
+        if (recoveredAccounts.length > 0) {
+          return recoveredAccounts[0];
+        }
+      }
+      
       return null;
     }
     
@@ -772,21 +832,28 @@ async function getNextAvailableAccount() {
   }
 }
 
-// User Alias Management
+// User Alias Management - Only return most recent one
 export async function getUserAliases(userId) {
   if (!userId) return [];
   
   try {
-    // Get all aliases from memory cache for this user
+    // Get only the most recent alias from memory cache for this user
     const userAliases = [];
+    let mostRecentAlias = null;
+    let mostRecentTime = 0;
     
     for (const [alias, data] of aliasCache.entries()) {
-      if (data.userId === userId) {
-        userAliases.push(alias);
+      if (data.userId === userId && data.created > mostRecentTime) {
+        mostRecentAlias = alias;
+        mostRecentTime = data.created;
       }
     }
     
-    console.log(`User ${userId} has ${userAliases.length} aliases in memory cache`);
+    if (mostRecentAlias) {
+      userAliases.push(mostRecentAlias);
+    }
+    
+    console.log(`User ${userId} has 1 recent alias in memory cache: ${mostRecentAlias}`);
     return userAliases;
   } catch (error) {
     console.error('Failed to get user aliases from memory:', error);
@@ -972,7 +1039,7 @@ export async function getGmailCredentials() {
   }
 }
 
-// Verify a credential
+// Verify a credential with enhanced security checks
 export async function verifyCredential(credentialId) {
   try {
     // Get credential from database
@@ -1012,8 +1079,26 @@ export async function verifyCredential(credentialId) {
   }
 }
 
-// Setup periodic cleanup task
-setInterval(cleanupInactiveAliases, 3600000); // Run every hour
+// Run alias cleanup every hour
+setInterval(cleanupInactiveAliases, 60 * 60 * 1000);
+
+// Setup auto-recovery for non-auth-error accounts
+setInterval(async () => {
+  try {
+    const [result] = await pool.query(`
+      UPDATE gmail_accounts 
+      SET status = 'active', updated_at = NOW() 
+      WHERE status NOT IN ('active', 'auth-error') 
+      AND updated_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE)
+    `);
+    
+    if (result.affectedRows > 0) {
+      console.log(`Auto-recovered ${result.affectedRows} Gmail accounts`);
+    }
+  } catch (error) {
+    console.error('Error in auto-recovery process:', error);
+  }
+}, 15 * 60 * 1000); // Run every 15 minutes
 
 // Initialize OAuth URL generator
 export function getAuthUrl(credentialId = null) {

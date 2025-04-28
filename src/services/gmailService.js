@@ -234,6 +234,11 @@ export async function getValidAccessToken(accountEmail) {
     oauth2Client.setCredentials({ refresh_token: refreshToken });
     const { credentials } = await oauth2Client.refreshAccessToken();
     
+    // Make sure we have a valid expiration time (never NaN)
+    const expiresAt = credentials.expires_in 
+      ? Date.now() + (Number(credentials.expires_in) * 1000) 
+      : Date.now() + (3600 * 1000); // Default to 1 hour if no expiration provided
+    
     // Update account with new tokens in database
     await pool.query(
       `UPDATE gmail_accounts SET 
@@ -245,7 +250,7 @@ export async function getValidAccessToken(accountEmail) {
        WHERE email = ?`,
       [
         credentials.access_token,
-        Date.now() + (credentials.expires_in * 1000),
+        expiresAt,
         accountEmail
       ]
     );
@@ -620,19 +625,20 @@ async function pollForNewEmails(accountEmail) {
   } catch (error) {
     console.error(`Error polling Gmail account ${accountEmail}:`, error);
     
-    // Determine error type and update status in database
-    let errorStatus = 'error';
-    
+    // Update account status in database with more detailed status
+    let statusUpdate = 'error';
     if (error.message.includes('quota') || error.message.includes('rate limit')) {
-      errorStatus = 'rate-limited';
+      statusUpdate = 'rate-limited';
     } else if (error.message.includes('auth') || error.message.includes('token')) {
-      errorStatus = 'auth-error';
+      statusUpdate = 'auth-error';
+    } else if (error.message.includes('network') || error.message.includes('timeout')) {
+      statusUpdate = 'network-error';
     }
     
     try {
       await pool.query(
         'UPDATE gmail_accounts SET status = ?, updated_at = NOW() WHERE email = ?',
-        [errorStatus, accountEmail]
+        [statusUpdate, accountEmail]
       );
     } catch (dbError) {
       console.error('Error updating account status:', dbError);
@@ -829,7 +835,7 @@ setInterval(async () => {
 // Load Balancing with improved account selection
 async function getNextAvailableAccount() {
   try {
-    // Get all available accounts with balancing strategy
+    // Get available accounts with balancing strategy
     const [accounts] = await pool.query(`
       SELECT * 
       FROM gmail_accounts a
@@ -1156,6 +1162,9 @@ export async function getGmailAccountStats() {
       totalAccounts: accountsCount[0].count,
       totalAliases: aliasCount,
       totalUsers: userIds.size,
+      active: accounts.filter(a => a.status === 'active').length,
+      auth_error: accounts.filter(a => a.status === 'auth-error').length,
+      rate_limited: accounts.filter(a => a.status === 'rate-limited').length,
       accounts: accounts.map(account => ({
         id: account.id,
         email: account.email,
@@ -1181,38 +1190,6 @@ export function getEmailCacheStats() {
     size: emailCache.size,
     maxSize: MAX_CACHE_SIZE
   };
-}
-
-// Initialize polling for all active accounts on startup
-export async function initializeGmailService() {
-  try {
-    // Ensure credentials are available
-    const [credentialsCount] = await pool.query(
-      'SELECT COUNT(*) as count FROM gmail_credentials'
-    );
-    
-    if (credentialsCount[0].count === 0) {
-      console.log('No Gmail credentials found in database. Skipping Gmail service initialization.');
-      return false;
-    }
-    
-    // Get all active accounts
-    const [accounts] = await pool.query(
-      'SELECT * FROM gmail_accounts WHERE status = \'active\''
-    );
-    
-    console.log(`Initializing Gmail service with ${accounts.length} active accounts`);
-    
-    // Start polling for each account
-    accounts.forEach(account => {
-      schedulePolling(account.email);
-    });
-    
-    return true;
-  } catch (error) {
-    console.error('Failed to initialize Gmail service:', error);
-    return false;
-  }
 }
 
 // Export for testing and monitoring

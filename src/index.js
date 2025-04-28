@@ -17,6 +17,7 @@ import monitorRoutes from './routes/monitor.js';
 import gmailRoutes from './routes/gmailRoutes.js'; // Added Gmail routes
 import debugRoutes from './routes/debug.js'; // Added Debug routes
 import nodemailer from 'nodemailer';
+import { initializeGmailService } from './services/gmailService.js'; // Import Gmail service initializer
 
 dotenv.config();
 
@@ -185,6 +186,15 @@ initializeDatabase().then(() => {
     console.log(`Server running on port ${port}`);
     scheduleCleanup();
     console.log('Email cleanup scheduler started');
+    
+    // Initialize Gmail service
+    initializeGmailService()
+      .then(() => {
+        console.log('Gmail service initialized successfully');
+      })
+      .catch(error => {
+        console.error('Failed to initialize Gmail service:', error);
+      });
   });
 }).catch(error => {
   console.error('Failed to initialize database:', error);

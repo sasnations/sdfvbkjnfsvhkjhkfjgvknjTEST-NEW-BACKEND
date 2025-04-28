@@ -285,10 +285,13 @@ router.get('/admin/accounts-alt', async (req, res) => {
       const result = await addGmailAccount(code.toString());
       console.log('Successfully added Gmail account:', result.email);
       
-      // Redirect back to the admin page
+      // Redirect back to the admin page with success parameters
       res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?success=true&email=${encodeURIComponent(result.email)}`);
     } catch (error) {
       console.error('Failed to add Gmail account in callback:', error);
+      
+      // Redirect with error message
+      const errorMsg = error.message || 'Failed to add Gmail account';
       res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?error=${encodeURIComponent('Failed to add Gmail account: ' + error.message)}`);
     }
   } catch (error) {

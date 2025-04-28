@@ -733,7 +733,46 @@ function addToEmailCache(key, email) {
   });
 }
 
-// Alias Management - In-memory only now
+// Alias Management - Only return most recent one
+export async function getUserAliases(userId) {
+  if (!userId) return [];
+  
+  try {
+    // Get only the most recent alias from memory cache for this user
+    const userAliases = [];
+    let mostRecentAlias = null;
+    let mostRecentTime = 0;
+    
+    for (const [alias, data] of aliasCache.entries()) {
+      if (data.userId === userId && data.created > mostRecentTime) {
+        mostRecentAlias = alias;
+        mostRecentTime = data.created;
+      }
+    }
+    
+    if (mostRecentAlias) {
+      userAliases.push(mostRecentAlias);
+    }
+    
+    console.log(`User ${userId} has 1 recent alias in memory cache: ${mostRecentAlias}`);
+    return userAliases;
+  } catch (error) {
+    console.error('Failed to get user aliases from memory:', error);
+    return [];
+  }
+}
+
+export async function rotateUserAlias(userId) {
+  try {
+    // Generate a new alias for the user (will use load balancing)
+    return await generateGmailAlias(userId);
+  } catch (error) {
+    console.error('Failed to rotate Gmail alias:', error);
+    throw error;
+  }
+}
+
+// Cleanup and maintenance
 export async function cleanupInactiveAliases() {
   console.log('Running in-memory alias cleanup...');
   
@@ -765,6 +804,27 @@ export async function cleanupInactiveAliases() {
     console.log(`Cleaned up ${inMemoryCleanupCount} inactive aliases from memory cache`);
   }
 }
+
+// Run alias cleanup every hour
+setInterval(cleanupInactiveAliases, 60 * 60 * 1000);
+
+// Setup auto-recovery for non-auth-error accounts
+setInterval(async () => {
+  try {
+    const [result] = await pool.query(`
+      UPDATE gmail_accounts 
+      SET status = 'active', updated_at = NOW() 
+      WHERE status NOT IN ('active', 'auth-error') 
+      AND updated_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE)
+    `);
+    
+    if (result.affectedRows > 0) {
+      console.log(`Auto-recovered ${result.affectedRows} Gmail accounts`);
+    }
+  } catch (error) {
+    console.error('Error in auto-recovery process:', error);
+  }
+}, 15 * 60 * 1000); // Run every 15 minutes
 
 // Load Balancing with improved account selection
 async function getNextAvailableAccount() {
@@ -829,45 +889,6 @@ async function getNextAvailableAccount() {
   } catch (error) {
     console.error('Error selecting next available account:', error);
     return null;
-  }
-}
-
-// User Alias Management - Only return most recent one
-export async function getUserAliases(userId) {
-  if (!userId) return [];
-  
-  try {
-    // Get only the most recent alias from memory cache for this user
-    const userAliases = [];
-    let mostRecentAlias = null;
-    let mostRecentTime = 0;
-    
-    for (const [alias, data] of aliasCache.entries()) {
-      if (data.userId === userId && data.created > mostRecentTime) {
-        mostRecentAlias = alias;
-        mostRecentTime = data.created;
-      }
-    }
-    
-    if (mostRecentAlias) {
-      userAliases.push(mostRecentAlias);
-    }
-    
-    console.log(`User ${userId} has 1 recent alias in memory cache: ${mostRecentAlias}`);
-    return userAliases;
-  } catch (error) {
-    console.error('Failed to get user aliases from memory:', error);
-    return [];
-  }
-}
-
-export async function rotateUserAlias(userId) {
-  try {
-    // Generate a new alias for the user (will use load balancing)
-    return await generateGmailAlias(userId);
-  } catch (error) {
-    console.error('Failed to rotate Gmail alias:', error);
-    throw error;
   }
 }
 
@@ -1078,27 +1099,6 @@ export async function verifyCredential(credentialId) {
     throw new Error(`Credential verification failed: ${error.message}`);
   }
 }
-
-// Run alias cleanup every hour
-setInterval(cleanupInactiveAliases, 60 * 60 * 1000);
-
-// Setup auto-recovery for non-auth-error accounts
-setInterval(async () => {
-  try {
-    const [result] = await pool.query(`
-      UPDATE gmail_accounts 
-      SET status = 'active', updated_at = NOW() 
-      WHERE status NOT IN ('active', 'auth-error') 
-      AND updated_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE)
-    `);
-    
-    if (result.affectedRows > 0) {
-      console.log(`Auto-recovered ${result.affectedRows} Gmail accounts`);
-    }
-  } catch (error) {
-    console.error('Error in auto-recovery process:', error);
-  }
-}, 15 * 60 * 1000); // Run every 15 minutes
 
 // Initialize OAuth URL generator
 export function getAuthUrl(credentialId = null) {

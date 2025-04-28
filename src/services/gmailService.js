@@ -733,8 +733,7 @@ async function getNextAvailableAccount() {
   try {
     // Get all available accounts with balancing strategy
     const [accounts] = await pool.query(`
-      SELECT a.*, 
-             IFNULL((SELECT COUNT(*) FROM gmail_aliases WHERE parent_account_id = a.id), 0) as known_alias_count
+      SELECT * 
       FROM gmail_accounts a
       WHERE a.status = 'active' OR a.status = 'rate-limited'
       ORDER BY 
@@ -902,7 +901,12 @@ export async function updateGmailCredential(id, updates) {
     );
     
     return {
-      ...updatedCredentials[0],
+      id: updatedCredentials[0].id,
+      clientId: updatedCredentials[0].client_id,
+      redirectUri: updatedCredentials[0].redirect_uri,
+      active: updatedCredentials[0].active === 1,
+      usageCount: updatedCredentials[0].usage_count,
+      lastUsed: updatedCredentials[0].last_used,
       clientSecret: '***********'
     };
   } catch (error) {
@@ -950,7 +954,12 @@ export async function getGmailCredentials() {
     );
     
     return credentials.map(cred => ({
-      ...cred,
+      id: cred.id,
+      clientId: cred.client_id,
+      redirectUri: cred.redirect_uri,
+      active: cred.active === 1,
+      usageCount: cred.usage_count,
+      lastUsed: cred.last_used,
       clientSecret: '***********'
     }));
   } catch (error) {

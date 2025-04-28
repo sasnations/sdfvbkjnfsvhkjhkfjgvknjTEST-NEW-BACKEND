@@ -267,7 +267,7 @@ router.post('/admin/accounts-alt', async (req, res) => {
   }
 });
 
-// NEW: GET handler for OAuth callback
+// NEW: GET handler for OAuth callback - FIXED to remove undefined segment
 router.get('/admin/accounts-alt', async (req, res) => {
   try {
     // Get the code from query parameters
@@ -286,13 +286,15 @@ router.get('/admin/accounts-alt', async (req, res) => {
       console.log('Successfully added Gmail account:', result.email);
       
       // Redirect back to the admin page with success parameters
-      res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?success=true&email=${encodeURIComponent(result.email)}`);
+      // FIX: Remove the undefined path segment from redirect URL
+      res.redirect(`${process.env.FRONTEND_URL}/adminonlygmail?success=true&email=${encodeURIComponent(result.email)}`);
     } catch (error) {
       console.error('Failed to add Gmail account in callback:', error);
       
       // Redirect with error message
+      // FIX: Remove the undefined path segment from redirect URL
       const errorMsg = error.message || 'Failed to add Gmail account';
-      res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?error=${encodeURIComponent('Failed to add Gmail account: ' + error.message)}`);
+      res.redirect(`${process.env.FRONTEND_URL}/adminonlygmail?error=${encodeURIComponent(errorMsg)}`);
     }
   } catch (error) {
     console.error('OAuth callback general error:', error);

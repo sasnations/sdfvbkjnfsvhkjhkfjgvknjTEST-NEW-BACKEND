@@ -135,6 +135,10 @@ export async function addGmailAccount(code) {
       const encryptedRefreshToken = tokens.refresh_token ? encrypt(tokens.refresh_token) : 
                                    (existingAccounts.length > 0 ? existingAccounts[0].refresh_token : null);
       
+      // Calculate expiry time with a valid default if expires_in is not provided
+      const expiresIn = typeof tokens.expires_in === 'number' ? tokens.expires_in : 3600; // Default to 1 hour
+      const expiresAt = Date.now() + (expiresIn * 1000);
+      
       if (existingAccounts.length > 0) {
         // Update existing account
         await connection.query(
@@ -148,7 +152,7 @@ export async function addGmailAccount(code) {
            WHERE id = ?`,
           [
             tokens.access_token,
-            Date.now() + (tokens.expires_in * 1000),
+            expiresAt, // Using the fixed expires_at value
             encryptedRefreshToken,
             id
           ]
@@ -165,7 +169,7 @@ export async function addGmailAccount(code) {
             email,
             encryptedRefreshToken,
             tokens.access_token,
-            Date.now() + (tokens.expires_in * 1000)
+            expiresAt // Using the fixed expires_at value
           ]
         );
         console.log(`Added new Gmail account: ${email}`);

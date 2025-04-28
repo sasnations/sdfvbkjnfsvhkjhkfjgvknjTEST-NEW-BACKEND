@@ -1,25 +1,24 @@
 import { google } from 'googleapis';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
+import { pool } from '../db/init.js';
 
 // In-memory storage
-const gmailAccountsStore = new Map(); // Stores Gmail account credentials and tokens
-const aliasToAccountMap = new Map(); // Maps email aliases to parent Gmail accounts
-const userAliasMap = new Map(); // Maps users to their assigned aliases
 const emailCache = new Map(); // Cache for fetched emails
-const gmailCredentialsStore = new Map(); // Stores Gmail API credentials
+const aliasCache = new Map(); // Cache for active aliases during runtime
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
-const ALIAS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
-
-// Constants
+const ALIAS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds for in-memory cache
 const GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly'];
 const POLLING_INTERVALS = {
   high: 10000,    // 10 seconds
   medium: 30000,  // 30 seconds
   low: 60000      // 60 seconds
 };
+
+// Map to track active polling accounts
+const activePollingAccounts = new Set();
 
 // Encryption utilities for token security
 const encryptionKey = process.env.ENCRYPTION_KEY || 'default-encryption-key';
@@ -43,64 +42,68 @@ function decrypt(text) {
 }
 
 // OAuth client setup
-function getOAuthClient(specificCredential = null) {
+async function getOAuthClient(specificCredentialId = null) {
   let credential;
   
-  if (specificCredential) {
-    // Use the specified credential
-    credential = specificCredential;
-  } else {
-    // Get the next available credential using round-robin
-    credential = getNextAvailableCredential();
-    
-    if (!credential) {
-      console.log('No credentials available in store, using environment variables');
-      // Fallback to environment variables if no credentials in store
-      return new google.auth.OAuth2(
-        process.env.GMAIL_CLIENT_ID,
-        process.env.GMAIL_CLIENT_SECRET,
-        process.env.GMAIL_REDIRECT_URI
+  try {
+    if (specificCredentialId) {
+      // Use the specified credential
+      const [credentials] = await pool.query(
+        'SELECT * FROM gmail_credentials WHERE id = ?',
+        [specificCredentialId]
+      );
+      
+      if (credentials.length === 0) {
+        throw new Error(`Credential with ID ${specificCredentialId} not found`);
+      }
+      
+      credential = credentials[0];
+    } else {
+      // Get the next available credential using round-robin
+      const [credentials] = await pool.query(
+        'SELECT * FROM gmail_credentials WHERE active = true ORDER BY usage_count, last_used LIMIT 1'
+      );
+      
+      if (credentials.length === 0) {
+        console.error('No active Gmail credentials found in database');
+        
+        // Fallback to environment variables if no credentials in database
+        return new google.auth.OAuth2(
+          process.env.GMAIL_CLIENT_ID,
+          process.env.GMAIL_CLIENT_SECRET,
+          process.env.GMAIL_REDIRECT_URI
+        );
+      }
+      
+      credential = credentials[0];
+      
+      // Update usage count
+      await pool.query(
+        'UPDATE gmail_credentials SET usage_count = usage_count + 1, last_used = NOW() WHERE id = ?',
+        [credential.id]
       );
     }
+    
+    return new google.auth.OAuth2(
+      credential.client_id,
+      decrypt(credential.client_secret),
+      credential.redirect_uri
+    );
+  } catch (error) {
+    console.error('Error getting OAuth client:', error);
+    
+    // Fallback to environment variables
+    return new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      process.env.GMAIL_REDIRECT_URI
+    );
   }
-  
-  return new google.auth.OAuth2(
-    credential.clientId,
-    credential.clientSecret,
-    credential.redirectUri
-  );
-}
-
-// Get the next available Gmail credential using round-robin with status check
-function getNextAvailableCredential() {
-  // Log the current credentials state for debugging
-  console.log(`Credential store status: ${gmailCredentialsStore.size} credentials available`);
-  
-  // Get all active credentials
-  const activeCredentials = [...gmailCredentialsStore.values()]
-    .filter(cred => cred.active)
-    .sort((a, b) => a.usageCount - b.usageCount);
-  
-  if (activeCredentials.length === 0) {
-    console.error('No active Gmail credentials available');
-    return null;
-  }
-  
-  // Get the least used credential
-  const credential = activeCredentials[0];
-  console.log(`Using credential ${credential.id} with ${credential.usageCount} previous uses`);
-  
-  // Update usage stats
-  credential.usageCount += 1;
-  credential.lastUsed = new Date().toISOString();
-  gmailCredentialsStore.set(credential.id, credential);
-  
-  return credential;
 }
 
 // Gmail Account Management
 export async function addGmailAccount(code) {
-  const oauth2Client = getOAuthClient();
+  const oauth2Client = await getOAuthClient();
   
   try {
     console.log('Exchanging authorization code for tokens...');
@@ -117,138 +120,215 @@ export async function addGmailAccount(code) {
     const email = profile.data.emailAddress;
     console.log(`Successfully obtained profile for email: ${email}`);
     
-    // Check if this account already exists
-    if (gmailAccountsStore.has(email)) {
-      console.log(`Account ${email} already exists, updating tokens`);
-      const existingAccount = gmailAccountsStore.get(email);
-      existingAccount.accessToken = tokens.access_token;
-      existingAccount.expiresAt = Date.now() + (tokens.expires_in * 1000);
-      if (tokens.refresh_token) {
-        existingAccount.refreshToken = encrypt(tokens.refresh_token);
+    // Start a transaction
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      
+      // Check if account already exists
+      const [existingAccounts] = await connection.query(
+        'SELECT * FROM gmail_accounts WHERE email = ?',
+        [email]
+      );
+      
+      const id = existingAccounts.length > 0 ? existingAccounts[0].id : uuidv4();
+      const encryptedRefreshToken = tokens.refresh_token ? encrypt(tokens.refresh_token) : 
+                                   (existingAccounts.length > 0 ? existingAccounts[0].refresh_token : null);
+      
+      if (existingAccounts.length > 0) {
+        // Update existing account
+        await connection.query(
+          `UPDATE gmail_accounts SET 
+           access_token = ?,
+           expires_at = ?,
+           refresh_token = COALESCE(?, refresh_token),
+           status = 'active',
+           last_used = NOW(),
+           updated_at = NOW()
+           WHERE id = ?`,
+          [
+            tokens.access_token,
+            Date.now() + (tokens.expires_in * 1000),
+            encryptedRefreshToken,
+            id
+          ]
+        );
+        console.log(`Updated existing Gmail account: ${email}`);
+      } else {
+        // Insert new account
+        await connection.query(
+          `INSERT INTO gmail_accounts (
+            id, email, refresh_token, access_token, expires_at, quota_used, status, last_used
+          ) VALUES (?, ?, ?, ?, ?, 0, 'active', NOW())`,
+          [
+            id,
+            email,
+            encryptedRefreshToken,
+            tokens.access_token,
+            Date.now() + (tokens.expires_in * 1000)
+          ]
+        );
+        console.log(`Added new Gmail account: ${email}`);
       }
-      existingAccount.status = 'active'; // Ensure the account is active
-      existingAccount.lastUsed = Date.now();
-      gmailAccountsStore.set(email, existingAccount);
-    } else {
-      console.log(`Adding new Gmail account: ${email}`);
-      // Store account in memory with encrypted refresh token
-      gmailAccountsStore.set(email, {
-        email,
-        refreshToken: tokens.refresh_token ? encrypt(tokens.refresh_token) : null,
-        accessToken: tokens.access_token,
-        expiresAt: Date.now() + (tokens.expires_in * 1000),
-        quotaUsed: 0,
-        lastUsed: Date.now(),
-        aliases: [],
-        status: 'active'
-      });
+      
+      await connection.commit();
+      
+      // Start polling for this account if not already polling
+      if (!activePollingAccounts.has(email)) {
+        schedulePolling(email);
+        activePollingAccounts.add(email);
+      }
+      
+      return { email, id };
+      
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
     }
     
-    // Start polling for this account if it's new
-    if (!gmailAccountsStore.has(email)) {
-      schedulePolling(email);
-    }
-    
-    // Log all accounts for debugging
-    console.log('Current Gmail accounts:', [...gmailAccountsStore.keys()]);
-    
-    return { email };
   } catch (error) {
     console.error('Failed to add Gmail account:', error);
-    throw new Error('Failed to authenticate with Gmail');
+    throw new Error('Failed to authenticate with Gmail: ' + error.message);
   }
 }
 
 // Get or refresh access token
 export async function getValidAccessToken(accountEmail) {
   console.log(`Getting valid access token for ${accountEmail}...`);
-  const account = gmailAccountsStore.get(accountEmail);
   
-  if (!account) {
-    throw new Error('Gmail account not found');
-  }
-  
-  // Check if token is still valid
-  if (account.accessToken && account.expiresAt > Date.now()) {
-    console.log('Using existing valid access token');
-    return account.accessToken;
-  }
-  
-  // Refresh the token
   try {
-    console.log('Refreshing access token...');
-    const oauth2Client = getOAuthClient();
+    // Get account from database
+    const [accounts] = await pool.query(
+      'SELECT * FROM gmail_accounts WHERE email = ?',
+      [accountEmail]
+    );
     
-    if (!account.refreshToken) {
+    if (accounts.length === 0) {
+      throw new Error(`Gmail account ${accountEmail} not found`);
+    }
+    
+    const account = accounts[0];
+    
+    // Check if token is still valid
+    if (account.access_token && account.expires_at > Date.now()) {
+      console.log('Using existing valid access token');
+      return account.access_token;
+    }
+    
+    // Refresh the token
+    console.log('Refreshing access token...');
+    const oauth2Client = await getOAuthClient();
+    
+    if (!account.refresh_token) {
       throw new Error(`No refresh token available for ${accountEmail}`);
     }
     
-    const refreshToken = decrypt(account.refreshToken);
+    const refreshToken = decrypt(account.refresh_token);
     
     oauth2Client.setCredentials({ refresh_token: refreshToken });
     const { credentials } = await oauth2Client.refreshAccessToken();
     
-    // Update account with new tokens
-    account.accessToken = credentials.access_token;
-    account.expiresAt = Date.now() + (credentials.expires_in * 1000);
-    gmailAccountsStore.set(accountEmail, account);
+    // Update account with new tokens in database
+    await pool.query(
+      `UPDATE gmail_accounts SET 
+       access_token = ?,
+       expires_at = ?,
+       status = 'active',
+       last_used = NOW(),
+       updated_at = NOW()
+       WHERE email = ?`,
+      [
+        credentials.access_token,
+        Date.now() + (credentials.expires_in * 1000),
+        accountEmail
+      ]
+    );
     
     console.log('Token refreshed successfully');
-    return account.accessToken;
+    return credentials.access_token;
+    
   } catch (error) {
     console.error(`Failed to refresh access token for ${accountEmail}:`, error);
-    account.status = error.message.includes('quota') || error.message.includes('rate limit') 
+    
+    // Update account status in database
+    const statusUpdate = error.message.includes('quota') || error.message.includes('rate limit') 
       ? 'rate-limited' 
       : error.message.includes('auth') || error.message.includes('token')
         ? 'auth-error'
         : 'error';
     
-    gmailAccountsStore.set(accountEmail, account);
-    throw new Error('Failed to refresh access token');
+    try {
+      await pool.query(
+        'UPDATE gmail_accounts SET status = ?, updated_at = NOW() WHERE email = ?',
+        [statusUpdate, accountEmail]
+      );
+    } catch (dbError) {
+      console.error('Error updating account status:', dbError);
+    }
+    
+    throw new Error('Failed to refresh access token: ' + error.message);
   }
 }
 
 // Alias Generation
 export async function generateGmailAlias(userId, strategy = 'dot') {
-  // Get next available account using load balancing
-  const account = getNextAvailableAccount();
-  
-  if (!account) {
-    console.error('No Gmail accounts available. Current accounts:', [...gmailAccountsStore.keys()]);
-    throw new Error('No Gmail accounts available');
+  // Get next available account using load balancing from database
+  try {
+    const account = await getNextAvailableAccount();
+    
+    if (!account) {
+      console.error('No Gmail accounts available.');
+      throw new Error('No Gmail accounts available');
+    }
+    
+    console.log(`Generating ${strategy} alias using account: ${account.email}`);
+    
+    // Generate unique alias based on strategy
+    const alias = strategy === 'dot' 
+      ? generateDotAlias(account.email)
+      : generatePlusAlias(account.email);
+    
+    console.log(`Generated alias: ${alias}`);
+    
+    // Update alias count in database
+    const connection = await pool.getConnection();
+    
+    try {
+      await connection.beginTransaction();
+      
+      // Update alias count in gmail_accounts
+      await connection.query(
+        'UPDATE gmail_accounts SET alias_count = alias_count + 1, last_used = NOW(), updated_at = NOW() WHERE id = ?',
+        [account.id]
+      );
+      
+      await connection.commit();
+      
+      // Store in-memory alias cache
+      aliasCache.set(alias, {
+        parentAccount: account.email,
+        parentAccountId: account.id,
+        created: Date.now(),
+        lastAccessed: Date.now(),
+        userId: userId || null,
+        expires: new Date(Date.now() + ALIAS_TTL)
+      });
+      
+      return { alias };
+      
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+    
+  } catch (error) {
+    console.error('Failed to generate Gmail alias:', error);
+    throw new Error('Failed to generate alias: ' + error.message);
   }
-  
-  console.log(`Generating ${strategy} alias using account: ${account.email}`);
-  
-  // Generate unique alias based on strategy
-  const alias = strategy === 'dot' 
-    ? generateDotAlias(account.email)
-    : generatePlusAlias(account.email);
-  
-  console.log(`Generated alias: ${alias}`);
-  
-  // Map alias to account and user
-  aliasToAccountMap.set(alias, {
-    parentAccount: account.email,
-    created: Date.now(),
-    lastAccessed: Date.now()
-  });
-  
-  // Add alias to user's list (ensure userId exists for anonymous users)
-  const actualUserId = userId || `anon_${uuidv4()}`; 
-  console.log(`Mapping alias to user: ${actualUserId}`);
-  
-  if (!userAliasMap.has(actualUserId)) {
-    userAliasMap.set(actualUserId, []);
-  }
-  userAliasMap.get(actualUserId).push(alias);
-  
-  // Add alias to account
-  account.aliases.push(alias);
-  account.lastUsed = Date.now();
-  gmailAccountsStore.set(account.email, account);
-  
-  return { alias };
 }
 
 function generateDotAlias(email) {
@@ -284,96 +364,139 @@ function generatePlusAlias(email) {
 export async function fetchGmailEmails(userId, aliasEmail) {
   console.log(`Fetching emails for ${aliasEmail}, requested by user ${userId || 'anonymous'}`);
   
-  // Get alias mapping
-  const aliasMapping = aliasToAccountMap.get(aliasEmail);
-  
-  if (!aliasMapping) {
-    throw new Error('Alias not found');
-  }
-  
-  // Update last accessed timestamp
-  aliasMapping.lastAccessed = Date.now();
-  aliasToAccountMap.set(aliasEmail, aliasMapping);
-  
-  // Modified permission check: allow null userId (public) and handle anonymous users
-  if (userId) {
-    // For authenticated users, check if they own this alias
-    const isAnonymousUser = userId.startsWith('anon_');
+  try {
+    // Check if alias exists in memory cache first
+    let parentAccount = null;
     
-    // For authenticated but non-anonymous users, perform strict checking
-    if (!isAnonymousUser) {
-      if (userAliasMap.has(userId) && !userAliasMap.get(userId).includes(aliasEmail)) {
-        throw new Error('Unauthorized access to alias');
-      }
+    if (aliasCache.has(aliasEmail)) {
+      const cachedAlias = aliasCache.get(aliasEmail);
+      parentAccount = cachedAlias.parentAccount;
+      
+      // Update last accessed timestamp in memory
+      cachedAlias.lastAccessed = Date.now();
+      aliasCache.set(aliasEmail, cachedAlias);
+      
+      console.log(`Found alias ${aliasEmail} in memory cache, parent account: ${parentAccount}`);
     } else {
-      // For anonymous users, check if this alias was created with this anonymous ID
-      // But be more permissive - if userId not found, assume it's a new anonymous session
-      if (userAliasMap.has(userId) && !userAliasMap.get(userId).includes(aliasEmail)) {
-        // If the anonymous user has other aliases but not this one, add it
-        userAliasMap.get(userId).push(aliasEmail);
+      console.log(`Alias ${aliasEmail} not found in memory cache, checking user permissions`);
+      
+      // Modified permission check for aliases not in memory
+      // Check if this user has permission to access this alias (only for non-anonymous users)
+      if (userId && !userId.startsWith('anon_')) {
+        // For authenticated users, we'll be more permissive since we don't have DB records
+        // We'll generate a new alias for them instead of failing
+        console.log(`Authorized user ${userId} requesting missing alias, will create new one`);
+        const result = await generateGmailAlias(userId);
+        return fetchGmailEmails(userId, result.alias); // Recursive call with new alias
       }
+      
+      // For anonymous users with missing alias, also generate a new one
+      if (userId && userId.startsWith('anon_')) {
+        console.log(`Anonymous user ${userId} requesting missing alias, will create new one`);
+        const result = await generateGmailAlias(userId);
+        return fetchGmailEmails(userId, result.alias); // Recursive call with new alias
+      }
+      
+      throw new Error('Alias not found');
     }
-  }
-  
-  // Get account for this alias
-  const parentAccount = aliasMapping.parentAccount;
-  const account = gmailAccountsStore.get(parentAccount);
-  
-  if (!account) {
-    console.error(`Parent account ${parentAccount} not found for alias ${aliasEmail}`);
-    throw new Error('Gmail account unavailable');
-  }
-  
-  if (account.status !== 'active') {
-    console.error(`Account ${parentAccount} is not active. Current status: ${account.status}`);
     
-    // Auto-recovery: Try to reactivate account if it's not in auth-error state
-    if (account.status !== 'auth-error') {
-      console.log(`Attempting to reactivate account ${parentAccount}`);
-      account.status = 'active';
-      gmailAccountsStore.set(parentAccount, account);
-    } else {
+    if (!parentAccount) {
+      throw new Error('Parent account not found for alias');
+    }
+    
+    // Check parent account status
+    const [accounts] = await pool.query(
+      'SELECT * FROM gmail_accounts WHERE email = ?',
+      [parentAccount]
+    );
+    
+    if (accounts.length === 0) {
       throw new Error('Gmail account unavailable');
     }
-  }
-  
-  // Get cached emails first
-  console.log(`Looking for cached emails for alias ${aliasEmail}`);
-  const cachedEmails = [];
-  for (const [key, email] of emailCache.entries()) {
-    if (key.startsWith(`${aliasEmail}:`)) {
-      cachedEmails.push(email);
+    
+    const account = accounts[0];
+    
+    if (account.status !== 'active') {
+      console.error(`Account ${parentAccount} is not active. Current status: ${account.status}`);
+      
+      // Auto-recovery: Try to reactivate account if it's not in auth-error state
+      if (account.status !== 'auth-error') {
+        console.log(`Attempting to reactivate account ${parentAccount}`);
+        await pool.query(
+          'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE id = ?',
+          [account.id]
+        );
+      } else {
+        throw new Error('Gmail account unavailable - authentication error');
+      }
     }
-  }
+    
+    // Get cached emails
+    console.log(`Looking for cached emails for alias ${aliasEmail}`);
+    const cachedEmails = [];
+    for (const [key, email] of emailCache.entries()) {
+      if (key.startsWith(`${aliasEmail}:`)) {
+        cachedEmails.push(email);
+      }
+    }
+    
+    // Return cached emails sorted by date (newest first)
+    console.log(`Found ${cachedEmails.length} cached emails for ${aliasEmail}`);
+    return cachedEmails.sort((a, b) => 
+      new Date(b.internalDate) - new Date(a.internalDate)
+    );
   
-  // Return cached emails sorted by date (newest first)
-  console.log(`Found ${cachedEmails.length} cached emails for ${aliasEmail}`);
-  return cachedEmails.sort((a, b) => 
-    new Date(b.internalDate) - new Date(a.internalDate)
-  );
+  } catch (error) {
+    console.error(`Error fetching Gmail emails for ${aliasEmail}:`, error);
+    throw error;
+  }
 }
 
 // Email Polling (Background Task)
 async function pollForNewEmails(accountEmail) {
-  const account = gmailAccountsStore.get(accountEmail);
-  
-  if (!account || account.status !== 'active' || account.aliases.length === 0) {
-    console.log(`Skipping polling for ${accountEmail}: inactive or no aliases`);
-    return;
-  }
-  
   try {
+    // Get account from database
+    const [accounts] = await pool.query(
+      'SELECT * FROM gmail_accounts WHERE email = ?',
+      [accountEmail]
+    );
+    
+    if (accounts.length === 0) {
+      console.log(`Account ${accountEmail} not found, skipping polling`);
+      return;
+    }
+    
+    const account = accounts[0];
+    
+    if (account.status !== 'active') {
+      console.log(`Skipping polling for inactive account ${accountEmail} (status: ${account.status})`);
+      return;
+    }
+    
+    // Get all aliases associated with this account from in-memory cache only
+    const accountAliases = [];
+    for (const [alias, data] of aliasCache.entries()) {
+      if (data.parentAccount === accountEmail) {
+        accountAliases.push(alias);
+      }
+    }
+    
+    if (accountAliases.length === 0) {
+      console.log(`Skipping polling for ${accountEmail}: no aliases in memory cache`);
+      return;
+    }
+    
     // Get fresh access token
-    console.log(`Polling for new emails for account ${accountEmail}...`);
+    console.log(`Polling for new emails for account ${accountEmail} with ${accountAliases.length} aliases...`);
     const accessToken = await getValidAccessToken(accountEmail);
     
     // Initialize Gmail API client
-    const oauth2Client = getOAuthClient();
+    const oauth2Client = await getOAuthClient();
     oauth2Client.setCredentials({ access_token: accessToken });
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     
     // Fetch emails for all aliases associated with this account
-    for (const alias of account.aliases) {
+    for (const alias of accountAliases) {
       // Build query to get recent emails sent to this alias
       const query = `to:${alias} newer_than:10m`;
       
@@ -413,52 +536,82 @@ async function pollForNewEmails(accountEmail) {
       }
     }
     
-    // Update account metrics
-    account.lastPolled = Date.now();
-    account.quotaUsed += 1;
-    gmailAccountsStore.set(accountEmail, account);
+    // Update account metrics in database
+    await pool.query(
+      'UPDATE gmail_accounts SET quota_used = quota_used + 1, last_used = NOW(), updated_at = NOW() WHERE id = ?',
+      [account.id]
+    );
     
   } catch (error) {
     console.error(`Error polling Gmail account ${accountEmail}:`, error);
     
-    // Update account status based on error
+    // Determine error type and update status in database
+    let errorStatus = 'error';
+    
     if (error.message.includes('quota') || error.message.includes('rate limit')) {
-      account.status = 'rate-limited';
+      errorStatus = 'rate-limited';
     } else if (error.message.includes('auth') || error.message.includes('token')) {
-      account.status = 'auth-error';
-    } else {
-      account.status = 'error';
+      errorStatus = 'auth-error';
     }
     
-    gmailAccountsStore.set(accountEmail, account);
+    try {
+      await pool.query(
+        'UPDATE gmail_accounts SET status = ?, updated_at = NOW() WHERE email = ?',
+        [errorStatus, accountEmail]
+      );
+    } catch (dbError) {
+      console.error(`Failed to update account status for ${accountEmail}:`, dbError);
+    }
   }
 }
 
 function schedulePolling(accountEmail) {
-  const account = gmailAccountsStore.get(accountEmail);
+  console.log(`Setting up polling schedule for ${accountEmail}`);
   
-  if (!account || account.status !== 'active') {
-    console.log(`Not scheduling polling for inactive account: ${accountEmail}`);
-    return;
-  }
-  
-  // Determine polling interval based on activity
-  let interval = POLLING_INTERVALS.low;
-  
-  // More active accounts get polled more frequently
-  if (account.aliases.length > 10) {
-    interval = POLLING_INTERVALS.high;
-  } else if (account.aliases.length > 5) {
-    interval = POLLING_INTERVALS.medium;
-  }
-  
-  console.log(`Scheduling polling for ${accountEmail} with interval ${interval}ms`);
-  
-  // Schedule next poll
-  setTimeout(() => {
-    pollForNewEmails(accountEmail)
-      .finally(() => schedulePolling(accountEmail));
-  }, interval);
+  // Check if account is active (in a self-executing async function)
+  (async () => {
+    try {
+      const [accounts] = await pool.query(
+        'SELECT * FROM gmail_accounts WHERE email = ?',
+        [accountEmail]
+      );
+      
+      if (accounts.length === 0 || accounts[0].status !== 'active') {
+        console.log(`Not scheduling polling for inactive/missing account: ${accountEmail}`);
+        return;
+      }
+      
+      console.log(`Scheduling polling for ${accountEmail}`);
+      
+      // Determine polling interval based on activity
+      let interval = POLLING_INTERVALS.low;
+      
+      if (accounts[0].alias_count > 10) {
+        interval = POLLING_INTERVALS.high;
+      } else if (accounts[0].alias_count > 5) {
+        interval = POLLING_INTERVALS.medium;
+      }
+      
+      console.log(`Using polling interval of ${interval}ms for ${accountEmail}`);
+      
+      // Add to active polling set
+      activePollingAccounts.add(accountEmail);
+      
+      // Schedule first poll
+      setTimeout(() => {
+        pollForNewEmails(accountEmail)
+          .finally(() => {
+            // Only schedule next poll if account is still in active set
+            if (activePollingAccounts.has(accountEmail)) {
+              schedulePolling(accountEmail);
+            }
+          });
+      }, interval);
+      
+    } catch (error) {
+      console.error(`Error setting up polling for ${accountEmail}:`, error);
+    }
+  })();
 }
 
 // Process Gmail message into standardized format
@@ -542,185 +695,290 @@ function addToEmailCache(key, email) {
   });
 }
 
-// Alias Management
-export function cleanupInactiveAliases() {
-  console.log('Running alias cleanup...');
-  const now = Date.now();
-  let removedCount = 0;
+// Alias Management - In-memory only now
+export async function cleanupInactiveAliases() {
+  console.log('Running in-memory alias cleanup...');
   
-  for (const [alias, data] of aliasToAccountMap.entries()) {
+  // Clean up in-memory cache
+  const now = Date.now();
+  let inMemoryCleanupCount = 0;
+  
+  for (const [alias, data] of aliasCache.entries()) {
     if (now - data.lastAccessed > ALIAS_TTL) {
-      // Remove alias from mapping
-      aliasToAccountMap.delete(alias);
-      
-      // Remove from parent account's alias list
-      const account = gmailAccountsStore.get(data.parentAccount);
-      if (account) {
-        account.aliases = account.aliases.filter(a => a !== alias);
-        gmailAccountsStore.set(data.parentAccount, account);
-      }
-      
-      // Remove from user's alias list
-      for (const [userId, aliases] of userAliasMap.entries()) {
-        if (aliases.includes(alias)) {
-          userAliasMap.set(userId, aliases.filter(a => a !== alias));
-          break;
+      // Also keep track of account aliases to update count in DB
+      if (data.parentAccountId) {
+        try {
+          // Decrement alias count in the database
+          await pool.query(
+            'UPDATE gmail_accounts SET alias_count = GREATEST(0, alias_count - 1), updated_at = NOW() WHERE id = ?',
+            [data.parentAccountId]
+          );
+        } catch (error) {
+          console.error(`Error updating alias count for account ${data.parentAccountId}:`, error);
         }
       }
       
-      removedCount++;
+      aliasCache.delete(alias);
+      inMemoryCleanupCount++;
     }
   }
   
-  if (removedCount > 0) {
-    console.log(`Cleaned up ${removedCount} inactive aliases`);
+  if (inMemoryCleanupCount > 0) {
+    console.log(`Cleaned up ${inMemoryCleanupCount} inactive aliases from memory cache`);
   }
 }
 
-// Load Balancing - This is the critical function that needs fixing
-function getNextAvailableAccount() {
-  // Print all accounts and their status for debugging
-  console.log('Available Gmail accounts:');
-  for (const [email, account] of gmailAccountsStore.entries()) {
-    console.log(`- ${email}: status=${account.status}, aliases=${account.aliases.length}, quotaUsed=${account.quotaUsed}`);
-  }
-
-  // Get all active accounts
-  const availableAccounts = [...gmailAccountsStore.values()]
-    .filter(account => {
-      // Consider auth-error accounts as unavailable
-      if (account.status === 'auth-error') {
-        return false;
-      }
-      
-      // Auto-fix accounts in error states if they're not auth errors
-      if (account.status !== 'active') {
-        console.log(`Auto-recovering account ${account.email} from ${account.status} status`);
-        account.status = 'active';
-        gmailAccountsStore.set(account.email, account);
-      }
-      
-      return true;
-    })
-    // Use a fair load balancing algorithm
-    .sort((a, b) => {
-      // Primary: Sort by active status (active accounts first)
-      if (a.status === 'active' && b.status !== 'active') return -1;
-      if (a.status !== 'active' && b.status === 'active') return 1;
-      
-      // Secondary: Sort by number of aliases (fewer aliases first)
-      if (a.aliases.length !== b.aliases.length) {
-        return a.aliases.length - b.aliases.length;
-      }
-      
-      // Tertiary: Sort by quota usage (less usage first)
-      if (a.quotaUsed !== b.quotaUsed) {
-        return a.quotaUsed - b.quotaUsed;
-      }
-      
-      // Final tiebreaker: Sort by last used timestamp (least recently used first)
-      return a.lastUsed - b.lastUsed;
-    });
-  
-  if (availableAccounts.length === 0) {
-    console.error('No available Gmail accounts');
+// Load Balancing
+async function getNextAvailableAccount() {
+  try {
+    // Get all available accounts with balancing strategy
+    const [accounts] = await pool.query(`
+      SELECT a.*, 
+             IFNULL((SELECT COUNT(*) FROM gmail_aliases WHERE parent_account_id = a.id), 0) as known_alias_count
+      FROM gmail_accounts a
+      WHERE a.status = 'active' OR a.status = 'rate-limited'
+      ORDER BY 
+        CASE WHEN a.status = 'active' THEN 0 ELSE 1 END,  -- Active accounts first
+        a.alias_count ASC,                                -- Accounts with fewer aliases
+        a.quota_used ASC,                                 -- Accounts with less quota usage
+        a.last_used ASC                                   -- Least recently used accounts
+      LIMIT 1
+    `);
+    
+    if (accounts.length === 0) {
+      console.error('No available Gmail accounts');
+      return null;
+    }
+    
+    const selectedAccount = accounts[0];
+    
+    // Auto-recover rate-limited accounts after a cool-down period
+    if (selectedAccount.status !== 'active') {
+      await pool.query(
+        'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE id = ?',
+        [selectedAccount.id]
+      );
+    }
+    
+    console.log(`Selected account for new alias: ${selectedAccount.email} (aliases: ${selectedAccount.alias_count}, quota: ${selectedAccount.quota_used})`);
+    
+    return selectedAccount;
+  } catch (error) {
+    console.error('Error selecting next available account:', error);
     return null;
   }
-  
-  const selectedAccount = availableAccounts[0];
-  console.log(`Selected account for new alias: ${selectedAccount.email}`);
-  
-  return selectedAccount;
 }
 
 // User Alias Management
-export function getUserAliases(userId) {
+export async function getUserAliases(userId) {
   if (!userId) return [];
   
-  const aliases = userAliasMap.get(userId) || [];
-  console.log(`User ${userId} has ${aliases.length} aliases`);
-  return aliases;
+  try {
+    // Get all aliases from memory cache for this user
+    const userAliases = [];
+    
+    for (const [alias, data] of aliasCache.entries()) {
+      if (data.userId === userId) {
+        userAliases.push(alias);
+      }
+    }
+    
+    console.log(`User ${userId} has ${userAliases.length} aliases in memory cache`);
+    return userAliases;
+  } catch (error) {
+    console.error('Failed to get user aliases from memory:', error);
+    return [];
+  }
 }
 
-export function rotateUserAlias(userId) {
-  // Generate a new alias for the user
-  return generateGmailAlias(userId);
+export async function rotateUserAlias(userId) {
+  try {
+    // Generate a new alias for the user (will use load balancing)
+    return await generateGmailAlias(userId);
+  } catch (error) {
+    console.error('Failed to rotate Gmail alias:', error);
+    throw error;
+  }
 }
 
 // Credential Management
 export async function addGmailCredential(credential) {
   const id = uuidv4();
+  const connection = await pool.getConnection();
   
-  const newCredential = {
-    ...credential,
-    id,
-    usageCount: 0,
-    lastUsed: new Date().toISOString(),
-    active: true // Default to active
-  };
-  
-  gmailCredentialsStore.set(id, newCredential);
-  
-  return { ...newCredential, clientSecret: '***********' }; // Don't return the actual secret
+  try {
+    await connection.beginTransaction();
+    
+    // Encrypt client secret for database storage
+    const encryptedSecret = encrypt(credential.clientSecret);
+    
+    await connection.query(`
+      INSERT INTO gmail_credentials (
+        id, client_id, client_secret, redirect_uri, active, usage_count, last_used
+      ) VALUES (?, ?, ?, ?, ?, ?, NOW())
+    `, [
+      id,
+      credential.clientId,
+      encryptedSecret,
+      credential.redirectUri,
+      credential.active !== false,
+      credential.usageCount || 0
+    ]);
+    
+    await connection.commit();
+    
+    // Return credential without the actual secret
+    return { 
+      ...credential, 
+      id,
+      clientSecret: '***********' 
+    };
+  } catch (error) {
+    await connection.rollback();
+    console.error('Failed to add Gmail credential:', error);
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 export async function updateGmailCredential(id, updates) {
-  const credential = gmailCredentialsStore.get(id);
+  const connection = await pool.getConnection();
   
-  if (!credential) {
-    throw new Error('Credential not found');
+  try {
+    await connection.beginTransaction();
+    
+    // Get current credential to ensure it exists
+    const [credentials] = await connection.query(
+      'SELECT * FROM gmail_credentials WHERE id = ?',
+      [id]
+    );
+    
+    if (credentials.length === 0) {
+      throw new Error('Credential not found');
+    }
+    
+    // Prepare update fields
+    const updateFields = [];
+    const updateValues = [];
+    
+    if (updates.clientId) {
+      updateFields.push('client_id = ?');
+      updateValues.push(updates.clientId);
+    }
+    
+    if (updates.clientSecret) {
+      updateFields.push('client_secret = ?');
+      updateValues.push(encrypt(updates.clientSecret));
+    }
+    
+    if (updates.redirectUri) {
+      updateFields.push('redirect_uri = ?');
+      updateValues.push(updates.redirectUri);
+    }
+    
+    if (typeof updates.active !== 'undefined') {
+      updateFields.push('active = ?');
+      updateValues.push(updates.active);
+    }
+    
+    // Only update if there are fields to update
+    if (updateFields.length > 0) {
+      updateFields.push('updated_at = NOW()');
+      updateValues.push(id);
+      
+      await connection.query(
+        `UPDATE gmail_credentials SET ${updateFields.join(', ')} WHERE id = ?`,
+        updateValues
+      );
+    }
+    
+    await connection.commit();
+    
+    // Return updated credential
+    const [updatedCredentials] = await connection.query(
+      'SELECT id, client_id, redirect_uri, active, usage_count, last_used FROM gmail_credentials WHERE id = ?',
+      [id]
+    );
+    
+    return {
+      ...updatedCredentials[0],
+      clientSecret: '***********'
+    };
+  } catch (error) {
+    await connection.rollback();
+    console.error('Failed to update Gmail credential:', error);
+    throw error;
+  } finally {
+    connection.release();
   }
-  
-  const updatedCredential = {
-    ...credential,
-    ...updates
-  };
-  
-  gmailCredentialsStore.set(id, updatedCredential);
-  
-  return { ...updatedCredential, clientSecret: '***********' };
 }
 
 export async function deleteGmailCredential(id) {
-  if (!gmailCredentialsStore.has(id)) {
-    throw new Error('Credential not found');
+  try {
+    const [result] = await pool.query('DELETE FROM gmail_credentials WHERE id = ?', [id]);
+    
+    if (result.affectedRows === 0) {
+      throw new Error('Credential not found');
+    }
+  } catch (error) {
+    console.error('Failed to delete Gmail credential:', error);
+    throw error;
   }
-  
-  gmailCredentialsStore.delete(id);
 }
 
 export async function updateGmailCredentialStatus(id, active) {
-  const credential = gmailCredentialsStore.get(id);
-  
-  if (!credential) {
-    throw new Error('Credential not found');
+  try {
+    const [result] = await pool.query(
+      'UPDATE gmail_credentials SET active = ?, updated_at = NOW() WHERE id = ?',
+      [active, id]
+    );
+    
+    if (result.affectedRows === 0) {
+      throw new Error('Credential not found');
+    }
+  } catch (error) {
+    console.error('Failed to update Gmail credential status:', error);
+    throw error;
   }
-  
-  credential.active = active;
-  gmailCredentialsStore.set(id, credential);
 }
 
 export async function getGmailCredentials() {
-  return [...gmailCredentialsStore.values()].map(cred => ({
-    ...cred,
-    clientSecret: '***********' // Don't return the actual secrets
-  }));
+  try {
+    const [credentials] = await pool.query(
+      'SELECT id, client_id, redirect_uri, active, usage_count, last_used, created_at, updated_at FROM gmail_credentials'
+    );
+    
+    return credentials.map(cred => ({
+      ...cred,
+      clientSecret: '***********'
+    }));
+  } catch (error) {
+    console.error('Failed to get Gmail credentials:', error);
+    throw error;
+  }
 }
 
 // Verify a credential
 export async function verifyCredential(credentialId) {
-  const credential = gmailCredentialsStore.get(credentialId);
-  
-  if (!credential) {
-    throw new Error('Credential not found');
-  }
-  
   try {
+    // Get credential from database
+    const [credentials] = await pool.query(
+      'SELECT * FROM gmail_credentials WHERE id = ?',
+      [credentialId]
+    );
+    
+    if (credentials.length === 0) {
+      throw new Error('Credential not found');
+    }
+    
+    const credential = credentials[0];
+    
     // Create OAuth client with this credential
     const oauth2Client = new google.auth.OAuth2(
-      credential.clientId,
-      credential.clientSecret,
-      credential.redirectUri
+      credential.client_id,
+      decrypt(credential.client_secret),
+      credential.redirect_uri
     );
     
     // Get the auth URL to verify the credentials are valid
@@ -746,45 +1004,78 @@ setInterval(cleanupInactiveAliases, 3600000); // Run every hour
 
 // Initialize OAuth URL generator
 export function getAuthUrl(credentialId = null) {
-  let oauth2Client;
-  
-  if (credentialId) {
-    const credential = gmailCredentialsStore.get(credentialId);
-    if (!credential) {
-      throw new Error('Credential not found');
+  return new Promise(async (resolve, reject) => {
+    try {
+      let oauth2Client;
+      
+      if (credentialId) {
+        oauth2Client = await getOAuthClient(credentialId);
+      } else {
+        oauth2Client = await getOAuthClient();
+      }
+      
+      const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: GMAIL_SCOPES,
+        prompt: 'consent' // Force to get refresh token
+      });
+      
+      resolve(authUrl);
+    } catch (error) {
+      console.error('Failed to generate auth URL:', error);
+      reject(error);
     }
-    oauth2Client = getOAuthClient(credential);
-  } else {
-    oauth2Client = getOAuthClient();
-  }
-  
-  return oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: GMAIL_SCOPES,
-    prompt: 'consent' // Force to get refresh token
   });
 }
 
 // Admin functions
-export function getGmailAccountStats() {
-  const stats = {
-    totalAccounts: gmailAccountsStore.size,
-    totalAliases: aliasToAccountMap.size,
-    totalUsers: userAliasMap.size,
-    accounts: []
-  };
-  
-  for (const [email, account] of gmailAccountsStore.entries()) {
-    stats.accounts.push({
-      email,
-      status: account.status,
-      aliasCount: account.aliases.length,
-      quotaUsed: account.quotaUsed,
-      lastUsed: account.lastUsed
-    });
+export async function getGmailAccountStats() {
+  try {
+    // Get overall stats
+    const [accountsCount] = await pool.query(
+      'SELECT COUNT(*) as count FROM gmail_accounts'
+    );
+    
+    // Count aliases from in-memory cache
+    const aliasCount = aliasCache.size;
+    
+    // Count unique users from in-memory cache
+    const userIds = new Set();
+    for (const data of aliasCache.values()) {
+      if (data.userId) {
+        userIds.add(data.userId);
+      }
+    }
+    
+    // Get account details
+    const [accounts] = await pool.query(`
+      SELECT id, email, status, quota_used, alias_count, last_used, updated_at
+      FROM gmail_accounts
+      ORDER BY last_used DESC
+    `);
+    
+    return {
+      totalAccounts: accountsCount[0].count,
+      totalAliases: aliasCount,
+      totalUsers: userIds.size,
+      accounts: accounts.map(account => ({
+        id: account.id,
+        email: account.email,
+        status: account.status,
+        aliasCount: account.alias_count,
+        quotaUsed: account.quota_used,
+        lastUsed: account.last_used
+      }))
+    };
+  } catch (error) {
+    console.error('Failed to get Gmail account stats:', error);
+    return {
+      totalAccounts: 0,
+      totalAliases: 0,
+      totalUsers: 0,
+      accounts: []
+    };
   }
-  
-  return stats;
 }
 
 export function getEmailCacheStats() {
@@ -794,11 +1085,40 @@ export function getEmailCacheStats() {
   };
 }
 
+// Initialize polling for all active accounts on startup
+export async function initializeGmailService() {
+  try {
+    // Ensure credentials are available
+    const [credentialsCount] = await pool.query(
+      'SELECT COUNT(*) as count FROM gmail_credentials'
+    );
+    
+    if (credentialsCount[0].count === 0) {
+      console.log('No Gmail credentials found in database. Skipping Gmail service initialization.');
+      return false;
+    }
+    
+    // Get all active accounts
+    const [accounts] = await pool.query(
+      'SELECT * FROM gmail_accounts WHERE status = \'active\''
+    );
+    
+    console.log(`Initializing Gmail service with ${accounts.length} active accounts`);
+    
+    // Start polling for each account
+    accounts.forEach(account => {
+      schedulePolling(account.email);
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Failed to initialize Gmail service:', error);
+    return false;
+  }
+}
+
 // Export for testing and monitoring
 export const stores = {
-  gmailAccountsStore,
-  aliasToAccountMap,
-  userAliasMap,
   emailCache,
-  gmailCredentialsStore
+  aliasCache
 };

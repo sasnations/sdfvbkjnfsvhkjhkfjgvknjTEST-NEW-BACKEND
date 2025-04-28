@@ -80,7 +80,7 @@ export async function generateGmailDebugReport() {
   return report;
 }
 
-// Function to dump the Gmail debug report to the console
+// Function to dump the Gmail service status to the console
 export async function dumpGmailServiceStatus() {
   const report = await generateGmailDebugReport();
   

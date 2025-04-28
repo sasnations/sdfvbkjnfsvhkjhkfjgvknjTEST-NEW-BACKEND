@@ -34,7 +34,10 @@ router.post('/create', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to create Gmail alias:', error);
-    res.status(400).json({ error: error.message || 'Failed to create Gmail alias' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to create Gmail alias',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -43,12 +46,15 @@ router.get('/aliases', async (req, res) => {
   try {
     // Allow both authenticated and unauthenticated users
     const userId = req.user?.id || req.query.userId || `anon_${uuidv4()}`;
-    const aliases = getUserAliases(userId);
+    const aliases = await getUserAliases(userId);
     
     res.json({ aliases });
   } catch (error) {
     console.error('Failed to fetch Gmail aliases:', error);
-    res.status(400).json({ error: error.message || 'Failed to fetch Gmail aliases' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to fetch Gmail aliases',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -64,7 +70,10 @@ router.get('/:alias/emails', async (req, res) => {
     res.json({ emails });
   } catch (error) {
     console.error('Failed to fetch emails:', error);
-    res.status(400).json({ error: error.message || 'Failed to fetch emails' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to fetch emails',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -79,7 +88,10 @@ router.post('/rotate', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to rotate Gmail alias:', error);
-    res.status(400).json({ error: error.message || 'Failed to rotate Gmail alias' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to rotate Gmail alias',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -88,7 +100,7 @@ router.post('/rotate', async (req, res) => {
 // Public routes for non-authenticated users
 router.post('/public/create', async (req, res) => {
   try {
-    const userId = `anon_${uuidv4()}`;
+    const userId = req.query.userId || `anon_${uuidv4()}`;
     const { strategy } = req.body; // 'dot' or 'plus'
     
     const result = await generateGmailAlias(userId, strategy);
@@ -96,19 +108,25 @@ router.post('/public/create', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to create Gmail alias:', error);
-    res.status(400).json({ error: error.message || 'Failed to create Gmail alias' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to create Gmail alias',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
 router.get('/public/aliases/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const aliases = getUserAliases(userId);
+    const aliases = await getUserAliases(userId);
     
     res.json({ aliases });
   } catch (error) {
     console.error('Failed to fetch Gmail aliases:', error);
-    res.status(400).json({ error: error.message || 'Failed to fetch Gmail aliases' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to fetch Gmail aliases',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -122,7 +140,10 @@ router.get('/public/emails/:alias', async (req, res) => {
     res.json({ emails });
   } catch (error) {
     console.error('Failed to fetch emails:', error);
-    res.status(400).json({ error: error.message || 'Failed to fetch emails' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to fetch emails',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -139,7 +160,10 @@ router.post('/public/rotate', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to rotate Gmail alias:', error);
-    res.status(400).json({ error: error.message || 'Failed to rotate Gmail alias' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to rotate Gmail alias',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -148,12 +172,22 @@ router.post('/public/rotate', async (req, res) => {
 // Get OAuth URL for adding a new Gmail account
 router.get('/admin/auth-url', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const authUrl = getAuthUrl();
+    const { credentialId } = req.query; // Optional credential ID
+    let authUrl;
+    
+    if (credentialId) {
+      authUrl = await getAuthUrl(credentialId);
+    } else {
+      authUrl = await getAuthUrl();
+    }
     
     res.json({ authUrl });
   } catch (error) {
     console.error('Failed to generate auth URL:', error);
-    res.status(400).json({ error: error.message || 'Failed to generate auth URL' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to generate auth URL',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -166,12 +200,22 @@ router.get('/admin/auth-url-alt', async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
-    const authUrl = getAuthUrl();
+    const { credentialId } = req.query; // Optional credential ID
+    let authUrl;
+    
+    if (credentialId) {
+      authUrl = await getAuthUrl(credentialId);
+    } else {
+      authUrl = await getAuthUrl();
+    }
     
     res.json({ authUrl });
   } catch (error) {
     console.error('Failed to generate auth URL:', error);
-    res.status(400).json({ error: error.message || 'Failed to generate auth URL' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to generate auth URL',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -189,7 +233,10 @@ router.post('/admin/accounts', authenticateToken, requireAdmin, async (req, res)
     res.json(result);
   } catch (error) {
     console.error('Failed to add Gmail account:', error);
-    res.status(400).json({ error: error.message || 'Failed to add Gmail account' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to add Gmail account',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -213,7 +260,10 @@ router.post('/admin/accounts-alt', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to add Gmail account:', error);
-    res.status(400).json({ error: error.message || 'Failed to add Gmail account' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to add Gmail account',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -239,7 +289,7 @@ router.get('/admin/accounts-alt', async (req, res) => {
       res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?success=true&email=${encodeURIComponent(result.email)}`);
     } catch (error) {
       console.error('Failed to add Gmail account in callback:', error);
-      res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?error=${encodeURIComponent('Failed to add Gmail account')}`);
+      res.redirect(`${process.env.VITE_FRONTEND_URL}/adminonlygmail?error=${encodeURIComponent('Failed to add Gmail account: ' + error.message)}`);
     }
   } catch (error) {
     console.error('OAuth callback general error:', error);
@@ -267,7 +317,10 @@ router.post('/admin/verify-credential', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to verify credential:', error);
-    res.status(400).json({ error: error.message || 'Failed to verify credential' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to verify credential',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -291,14 +344,17 @@ router.get('/admin/verify-credential', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Failed to verify credential (GET):', error);
-    res.status(400).json({ error: error.message || 'Failed to verify credential' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to verify credential',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
 // Get Gmail accounts statistics
 router.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const accountStats = getGmailAccountStats();
+    const accountStats = await getGmailAccountStats();
     const cacheStats = getEmailCacheStats();
     
     res.json({
@@ -307,7 +363,10 @@ router.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => 
     });
   } catch (error) {
     console.error('Failed to get Gmail stats:', error);
-    res.status(400).json({ error: error.message || 'Failed to get Gmail stats' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to get Gmail stats',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -320,7 +379,7 @@ router.get('/admin/stats-alt', async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
     
-    const accountStats = getGmailAccountStats();
+    const accountStats = await getGmailAccountStats();
     const cacheStats = getEmailCacheStats();
     
     res.json({
@@ -329,7 +388,10 @@ router.get('/admin/stats-alt', async (req, res) => {
     });
   } catch (error) {
     console.error('Failed to get Gmail stats:', error);
-    res.status(400).json({ error: error.message || 'Failed to get Gmail stats' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to get Gmail stats',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -346,7 +408,10 @@ router.get('/admin/credentials', async (req, res) => {
     res.json({ credentials });
   } catch (error) {
     console.error('Failed to get Gmail credentials:', error);
-    res.status(400).json({ error: error.message || 'Failed to get Gmail credentials' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to get Gmail credentials',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -370,14 +435,16 @@ router.post('/admin/credentials', async (req, res) => {
       clientSecret,
       redirectUri,
       active: active !== false,
-      usageCount: 0,
-      lastUsed: new Date().toISOString()
+      usageCount: 0
     });
     
     res.json(credential);
   } catch (error) {
     console.error('Failed to add Gmail credential:', error);
-    res.status(400).json({ error: error.message || 'Failed to add Gmail credential' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to add Gmail credential',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -393,21 +460,22 @@ router.put('/admin/credentials/:id', async (req, res) => {
     const { id } = req.params;
     const { clientId, clientSecret, redirectUri, active } = req.body;
     
-    if (!clientId || !clientSecret || !redirectUri) {
-      return res.status(400).json({ error: 'Client ID, Client Secret, and Redirect URI are required' });
-    }
+    // Allow partial updates
+    const updates = {};
+    if (clientId) updates.clientId = clientId;
+    if (clientSecret) updates.clientSecret = clientSecret;
+    if (redirectUri) updates.redirectUri = redirectUri;
+    if (typeof active !== 'undefined') updates.active = active;
     
-    const credential = await updateGmailCredential(id, {
-      clientId,
-      clientSecret,
-      redirectUri,
-      active: active !== false
-    });
+    const credential = await updateGmailCredential(id, updates);
     
     res.json(credential);
   } catch (error) {
     console.error('Failed to update Gmail credential:', error);
-    res.status(400).json({ error: error.message || 'Failed to update Gmail credential' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to update Gmail credential',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -426,7 +494,10 @@ router.delete('/admin/credentials/:id', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Failed to delete Gmail credential:', error);
-    res.status(400).json({ error: error.message || 'Failed to delete Gmail credential' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to delete Gmail credential',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -451,7 +522,10 @@ router.patch('/admin/credentials/:id/status', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Failed to update Gmail credential status:', error);
-    res.status(400).json({ error: error.message || 'Failed to update Gmail credential status' });
+    res.status(400).json({ 
+      error: error.message || 'Failed to update Gmail credential status',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 

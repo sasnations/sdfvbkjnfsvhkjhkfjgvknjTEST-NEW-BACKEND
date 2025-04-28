@@ -267,7 +267,7 @@ router.post('/admin/accounts-alt', async (req, res) => {
   }
 });
 
-// NEW: GET handler for OAuth callback - FIXED to remove undefined segment
+// GET handler for OAuth callback - FIXED to remove undefined segment
 router.get('/admin/accounts-alt', async (req, res) => {
   try {
     // Get the code from query parameters
@@ -329,7 +329,7 @@ router.post('/admin/verify-credential', async (req, res) => {
   }
 });
 
-// NEW: GET handler for credential verification (fallback)
+// GET handler for credential verification (fallback)
 router.get('/admin/verify-credential', async (req, res) => {
   try {
     // Check admin passphrase

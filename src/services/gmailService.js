@@ -476,6 +476,45 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   }
 }
 
+// Only return most recent one
+export async function getUserAliases(userId) {
+  if (!userId) return [];
+  
+  try {
+    // Get only the most recent alias from memory cache for this user
+    const userAliases = [];
+    let mostRecentAlias = null;
+    let mostRecentTime = 0;
+    
+    for (const [alias, data] of aliasCache.entries()) {
+      if (data.userId === userId && data.created > mostRecentTime) {
+        mostRecentAlias = alias;
+        mostRecentTime = data.created;
+      }
+    }
+    
+    if (mostRecentAlias) {
+      userAliases.push(mostRecentAlias);
+    }
+    
+    console.log(`User ${userId} has 1 recent alias in memory cache: ${mostRecentAlias}`);
+    return userAliases;
+  } catch (error) {
+    console.error('Failed to get user aliases from memory:', error);
+    return [];
+  }
+}
+
+export async function rotateUserAlias(userId) {
+  try {
+    // Generate a new alias for the user (will use load balancing)
+    return await generateGmailAlias(userId);
+  } catch (error) {
+    console.error('Failed to rotate Gmail alias:', error);
+    throw error;
+  }
+}
+
 // Email Polling (Background Task) with improved error handling and frequency
 async function pollForNewEmails(accountEmail) {
   try {
@@ -596,7 +635,7 @@ async function pollForNewEmails(accountEmail) {
         [errorStatus, accountEmail]
       );
     } catch (dbError) {
-      console.error(`Failed to update account status for ${accountEmail}:`, dbError);
+      console.error('Error updating account status:', dbError);
     }
   }
 }
@@ -733,45 +772,6 @@ function addToEmailCache(key, email) {
   });
 }
 
-// Alias Management - Only return most recent one
-export async function getUserAliases(userId) {
-  if (!userId) return [];
-  
-  try {
-    // Get only the most recent alias from memory cache for this user
-    const userAliases = [];
-    let mostRecentAlias = null;
-    let mostRecentTime = 0;
-    
-    for (const [alias, data] of aliasCache.entries()) {
-      if (data.userId === userId && data.created > mostRecentTime) {
-        mostRecentAlias = alias;
-        mostRecentTime = data.created;
-      }
-    }
-    
-    if (mostRecentAlias) {
-      userAliases.push(mostRecentAlias);
-    }
-    
-    console.log(`User ${userId} has 1 recent alias in memory cache: ${mostRecentAlias}`);
-    return userAliases;
-  } catch (error) {
-    console.error('Failed to get user aliases from memory:', error);
-    return [];
-  }
-}
-
-export async function rotateUserAlias(userId) {
-  try {
-    // Generate a new alias for the user (will use load balancing)
-    return await generateGmailAlias(userId);
-  } catch (error) {
-    console.error('Failed to rotate Gmail alias:', error);
-    throw error;
-  }
-}
-
 // Cleanup and maintenance
 export async function cleanupInactiveAliases() {
   console.log('Running in-memory alias cleanup...');
@@ -872,7 +872,7 @@ async function getNextAvailableAccount() {
       
       return null;
     }
-    
+
     const selectedAccount = accounts[0];
     
     // Auto-recover rate-limited accounts after a cool-down period

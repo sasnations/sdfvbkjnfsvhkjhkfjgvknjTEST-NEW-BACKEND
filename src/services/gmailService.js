@@ -1,3 +1,5 @@
+// backend/src/services/gmailService.js
+
 import { google } from 'googleapis';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
@@ -6,6 +8,7 @@ import { pool } from '../db/init.js';
 // In-memory storage
 const emailCache = new Map(); // Cache for fetched emails
 const aliasCache = new Map(); // Cache for active aliases during runtime
+const activePollingAccounts = new Set(); // Track which accounts are being actively polled
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
@@ -16,9 +19,6 @@ const POLLING_INTERVALS = {
   medium: 15000,  // 15 seconds for medium priority
   low: 30000      // 30 seconds for low priority accounts
 };
-
-// Map to track active polling accounts
-const activePollingAccounts = new Set();
 
 // Encryption utilities for token security
 const encryptionKey = process.env.ENCRYPTION_KEY || 'default-encryption-key';
@@ -139,6 +139,8 @@ export async function addGmailAccount(code) {
       const expiresIn = typeof tokens.expires_in === 'number' ? tokens.expires_in : 3600; // Default to 1 hour
       const expiresAt = Date.now() + (expiresIn * 1000);
       
+      const wasInAuthError = existingAccounts.length > 0 && existingAccounts[0].status === 'auth-error';
+
       if (existingAccounts.length > 0) {
         // Update existing account
         await connection.query(
@@ -177,10 +179,23 @@ export async function addGmailAccount(code) {
       
       await connection.commit();
       
-      // Start polling for this account if not already polling
-      if (!activePollingAccounts.has(email)) {
-        schedulePolling(email);
-        activePollingAccounts.add(email);
+      // Specifically handle reauthorized accounts that had auth errors before
+      if (wasInAuthError) {
+        console.log(`Account ${email} was previously in auth-error state, restarting polling...`);
+        // Remove from active polling if it was erroneously there
+        activePollingAccounts.delete(email);
+        
+        // Start fresh polling for this account
+        if (!activePollingAccounts.has(email)) {
+          schedulePolling(email);
+          activePollingAccounts.add(email);
+        }
+      } else {
+        // Standard polling start for new or active accounts
+        if (!activePollingAccounts.has(email)) {
+          schedulePolling(email);
+          activePollingAccounts.add(email);
+        }
       }
       
       return { email, id };
@@ -287,6 +302,13 @@ export async function getValidAccessToken(accountEmail) {
               'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE email = ?',
               [accountEmail]
             );
+            
+            // Restart polling for this account
+            if (!activePollingAccounts.has(accountEmail)) {
+              console.log(`Restarting polling for recovered account ${accountEmail}`);
+              schedulePolling(accountEmail);
+              activePollingAccounts.add(accountEmail);
+            }
           } catch (retryError) {
             console.error(`Failed to auto-recover ${accountEmail}:`, retryError);
           }
@@ -455,6 +477,13 @@ export async function fetchGmailEmails(userId, aliasEmail) {
           'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE id = ?',
           [account.id]
         );
+        
+        // If the account was inactive, reactivate polling for it
+        if (!activePollingAccounts.has(parentAccount)) {
+          console.log(`Restarting polling for reactivated account ${parentAccount}`);
+          schedulePolling(parentAccount);
+          activePollingAccounts.add(parentAccount);
+        }
       } else {
         throw new Error('Gmail account unavailable - authentication error');
       }
@@ -502,7 +531,7 @@ export async function getUserAliases(userId) {
       userAliases.push(mostRecentAlias);
     }
     
-    console.log(`User ${userId} has 1 recent alias in memory cache: ${mostRecentAlias}`);
+    console.log(`User ${userId} has ${userAliases.length} recent alias in memory cache: ${mostRecentAlias}`);
     return userAliases;
   } catch (error) {
     console.error('Failed to get user aliases from memory:', error);
@@ -538,9 +567,10 @@ async function pollForNewEmails(accountEmail) {
     
     if (account.status !== 'active') {
       console.log(`Skipping polling for inactive account ${accountEmail} (status: ${account.status})`);
-      // Try to auto-recover non-auth-error accounts after some time
+      
+      // Only attempt recovery if the account has been inactive for at least 10 minutes
+      // (but not if it's in auth-error state)
       if (account.status !== 'auth-error') {
-        // Only attempt recovery if the account has been inactive for at least 10 minutes
         const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
         if (new Date(account.updated_at) < tenMinutesAgo) {
           console.log(`Attempting to auto-recover account ${accountEmail}`);
@@ -631,6 +661,8 @@ async function pollForNewEmails(accountEmail) {
       statusUpdate = 'rate-limited';
     } else if (error.message.includes('auth') || error.message.includes('token')) {
       statusUpdate = 'auth-error';
+      // Remove from active polling set when auth error is detected
+      activePollingAccounts.delete(accountEmail);
     } else if (error.message.includes('network') || error.message.includes('timeout')) {
       statusUpdate = 'network-error';
     }
@@ -652,19 +684,28 @@ function schedulePolling(accountEmail) {
   // Check if account is active (in a self-executing async function)
   (async () => {
     try {
+      // Get latest account state from database to ensure we have the most current info
       const [accounts] = await pool.query(
         'SELECT * FROM gmail_accounts WHERE email = ?',
         [accountEmail]
       );
       
-      if (accounts.length === 0 || accounts[0].status !== 'active') {
-        console.log(`Not scheduling polling for inactive/missing account: ${accountEmail}`);
+      if (accounts.length === 0) {
+        console.log(`Not scheduling polling for missing account: ${accountEmail}`);
+        activePollingAccounts.delete(accountEmail); // Ensure it's removed from active set
+        return;
+      }
+      
+      const accountStatus = accounts[0].status;
+      if (accountStatus !== 'active') {
+        console.log(`Not scheduling polling for inactive account (${accountStatus}): ${accountEmail}`);
+        activePollingAccounts.delete(accountEmail); // Ensure it's removed from active set
         return;
       }
       
       console.log(`Scheduling polling for ${accountEmail}`);
       
-      // Determine polling interval based on activity - use more frequent intervals
+      // Determine polling interval based on activity
       let interval = POLLING_INTERVALS.medium; // Default to medium priority
       
       if (accounts[0].alias_count > 10) {
@@ -677,22 +718,27 @@ function schedulePolling(accountEmail) {
       
       console.log(`Using polling interval of ${interval}ms for ${accountEmail}`);
       
-      // Add to active polling set
-      activePollingAccounts.add(accountEmail);
+      // Only add to active set if it's not already being polled
+      if (!activePollingAccounts.has(accountEmail)) {
+        activePollingAccounts.add(accountEmail);
+      }
       
       // Schedule first poll
       setTimeout(() => {
         pollForNewEmails(accountEmail)
           .finally(() => {
-            // Only schedule next poll if account is still in active set
+            // Only schedule next poll if account is still in active set and polling should continue
             if (activePollingAccounts.has(accountEmail)) {
               schedulePolling(accountEmail);
+            } else {
+              console.log(`Stopped polling for ${accountEmail} as it's no longer in active set`);
             }
           });
       }, interval);
       
     } catch (error) {
       console.error(`Error setting up polling for ${accountEmail}:`, error);
+      // Don't remove from active polling on setup error - it may be temporary
     }
   })();
 }
@@ -814,6 +860,42 @@ export async function cleanupInactiveAliases() {
 // Run alias cleanup every hour
 setInterval(cleanupInactiveAliases, 60 * 60 * 1000);
 
+// Function to check for Gmail accounts that need polling restart
+export async function checkAndRestartPolling() {
+  try {
+    console.log("Running scheduled check for accounts needing polling restart...");
+    
+    // Get all active accounts that aren't currently being polled
+    const [accounts] = await pool.query(`
+      SELECT email FROM gmail_accounts 
+      WHERE status = 'active' AND updated_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+    `);
+    
+    if (!accounts || accounts.length === 0) {
+      console.log("No recently active accounts found that need polling restart");
+      return;
+    }
+    
+    // Start polling for any active accounts that aren't currently being polled
+    let restartCount = 0;
+    for (const account of accounts) {
+      if (!activePollingAccounts.has(account.email)) {
+        console.log(`Restarting polling for active account: ${account.email}`);
+        schedulePolling(account.email);
+        activePollingAccounts.add(account.email);
+        restartCount++;
+      }
+    }
+    
+    console.log(`Restarted polling for ${restartCount} accounts`);
+  } catch (error) {
+    console.error("Error checking for accounts needing polling restart:", error);
+  }
+}
+
+// Run the polling restart check every 15 minutes
+setInterval(checkAndRestartPolling, 15 * 60 * 1000);
+
 // Setup auto-recovery for non-auth-error accounts
 setInterval(async () => {
   try {
@@ -826,6 +908,22 @@ setInterval(async () => {
     
     if (result.affectedRows > 0) {
       console.log(`Auto-recovered ${result.affectedRows} Gmail accounts`);
+      
+      // Get the list of accounts that were auto-recovered so we can restart polling for them
+      const [recoveredAccounts] = await pool.query(`
+        SELECT email FROM gmail_accounts 
+        WHERE status = 'active'
+        AND updated_at > DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+      `);
+      
+      // Restart polling for recovered accounts
+      for (const account of recoveredAccounts) {
+        if (!activePollingAccounts.has(account.email)) {
+          console.log(`Restarting polling for auto-recovered account: ${account.email}`);
+          schedulePolling(account.email);
+          activePollingAccounts.add(account.email);
+        }
+      }
     }
   } catch (error) {
     console.error('Error in auto-recovery process:', error);
@@ -1131,6 +1229,48 @@ export function getAuthUrl(credentialId = null) {
     }
   });
 }
+
+// Function to force check and update all accounts
+export async function forceCheckAllAccounts() {
+  console.log("Performing forced check of all Gmail accounts...");
+  
+  try {
+    // Get all accounts from the database
+    const [allAccounts] = await pool.query(`SELECT * FROM gmail_accounts`);
+    
+    console.log(`Found ${allAccounts.length} Gmail accounts to check`);
+    
+    for (const account of allAccounts) {
+      const accountEmail = account.email;
+      
+      // If account is active but not being polled, start polling
+      if (account.status === 'active' && !activePollingAccounts.has(accountEmail)) {
+        console.log(`Starting polling for active account ${accountEmail} that wasn't being polled`);
+        schedulePolling(accountEmail);
+        activePollingAccounts.add(accountEmail);
+      }
+      // If account is inactive but being polled, stop polling
+      else if (account.status !== 'active' && activePollingAccounts.has(accountEmail)) {
+        console.log(`Removing inactive account ${accountEmail} from polling`);
+        activePollingAccounts.delete(accountEmail);
+      }
+    }
+    
+    // Log account status
+    console.log(`After check: ${activePollingAccounts.size} accounts actively polling`);
+    return {
+      totalAccounts: allAccounts.length,
+      activelyPolling: activePollingAccounts.size,
+      pollingAccounts: Array.from(activePollingAccounts)
+    };
+  } catch (error) {
+    console.error("Error performing forced account check:", error);
+    throw error;
+  }
+}
+
+// Check all accounts every 30 minutes to catch any polling issues
+setInterval(forceCheckAllAccounts, 30 * 60 * 1000);
 
 // Admin functions
 export async function getGmailAccountStats() {

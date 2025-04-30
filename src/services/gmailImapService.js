@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../db/init.js';
 import crypto from 'crypto';
 import { WebSocketServer } from 'ws';
+import { simpleParser } from 'mailparser';  // For better email parsing
 
 // In-memory storage
 const emailCache = new Map(); // Cache for fetched emails
@@ -25,6 +26,7 @@ const POLLING_INTERVALS = {
 };
 const CONNECTION_TIMEOUT = 60000; // 1 minute timeout for IMAP connections
 const IDLE_TIMEOUT = 540000; // 9 minutes idle timeout (Gmail drops at ~10 min)
+const MAX_EMAILS_PER_FETCH = 50; // Maximum number of emails to fetch at once
 
 // Encryption utilities for password security
 const encryptionKey = process.env.ENCRYPTION_KEY || 'default-encryption-key';
@@ -324,7 +326,7 @@ async function testImapConnection(email, appPassword) {
 }
 
 // Create and get IMAP client for an account
-async function getImapClient(accountEmail) {
+async function getImapClient(accountEmail, persistConnection = true) {
   try {
     // Get account from database
     const [accounts] = await pool.query(
@@ -348,7 +350,15 @@ async function getImapClient(accountEmail) {
       
       if (existingClient.usable) {
         console.log(`Using existing IMAP client for ${accountEmail}`);
-        return existingClient;
+        
+        // Perform a no-op to check that the connection is still active
+        try {
+          await existingClient.noop();
+          return existingClient;
+        } catch (noopError) {
+          console.warn(`NOOP failed for ${accountEmail}, connection may be stale:`, noopError);
+          // Continue to create a new connection
+        }
       }
       
       // Existing client not usable, close it if needed
@@ -389,14 +399,20 @@ async function getImapClient(accountEmail) {
     // Setup event listeners for connection monitoring
     client.on('error', err => {
       console.error(`IMAP client error for ${accountEmail}:`, err);
+      // Remove from active clients if there's a critical error
+      imapClients.delete(accountEmail);
     });
     
     client.on('close', () => {
       console.log(`IMAP connection closed for ${accountEmail}`);
+      // Remove from active clients on close
+      imapClients.delete(accountEmail);
     });
     
     client.on('end', () => {
       console.log(`IMAP connection ended for ${accountEmail}`);
+      // Remove from active clients on end
+      imapClients.delete(accountEmail);
     });
     
     // Connect to the server
@@ -404,8 +420,10 @@ async function getImapClient(accountEmail) {
       await client.connect();
       console.log(`IMAP client connected for ${accountEmail}`);
       
-      // Store the client
-      imapClients.set(accountEmail, client);
+      // Only store the client if we want a persistent connection
+      if (persistConnection) {
+        imapClients.set(accountEmail, client);
+      }
       
       // Reset reconnection counter on successful connection
       reconnectionAttempts.delete(accountEmail);
@@ -453,6 +471,7 @@ async function safelyCloseImapClient(accountEmail) {
     const client = imapClients.get(accountEmail);
     
     try {
+      // Don't remove from imapClients until we've successfully closed the connection
       if (client.usable) {
         await client.logout();
         console.log(`IMAP client safely logged out for ${accountEmail}`);
@@ -645,6 +664,16 @@ export async function fetchGmailEmails(userId, aliasEmail) {
       }
     }
     
+    // If we have very few emails in cache, trigger a fresh fetch
+    if (cachedEmails.length < 5) {
+      console.log(`Only ${cachedEmails.length} emails in cache for ${aliasEmail}, triggering immediate fetch`);
+      
+      // This happens in the background and won't block the response
+      fetchEmailsForAlias(parentAccount, aliasEmail).catch(error => {
+        console.error(`Background fetch failed for ${aliasEmail}:`, error);
+      });
+    }
+    
     // Return cached emails sorted by date (newest first)
     console.log(`Found ${cachedEmails.length} cached emails for ${aliasEmail}`);
     return cachedEmails.sort((a, b) => 
@@ -654,6 +683,176 @@ export async function fetchGmailEmails(userId, aliasEmail) {
   } catch (error) {
     console.error(`Error fetching Gmail emails for ${aliasEmail}:`, error);
     throw error;
+  }
+}
+
+// Fetch emails specifically for an alias (used for on-demand fetching)
+async function fetchEmailsForAlias(accountEmail, alias) {
+  let client = null;
+  
+  try {
+    // Get IMAP client - don't persist this client as it's a one-time fetch
+    client = await getImapClient(accountEmail, false);
+    
+    // List both INBOX and [Gmail]/Spam folders
+    const folders = ['INBOX', '[Gmail]/Spam'];
+    let totalEmails = 0;
+    
+    for (const folder of folders) {
+      try {
+        console.log(`Searching ${folder} for emails to ${alias}...`);
+        
+        // Select the mailbox
+        const mailbox = await client.mailboxOpen(folder);
+        console.log(`Opened ${folder} for ${accountEmail}, message count: ${mailbox.exists}`);
+        
+        // If no messages, skip to next folder
+        if (mailbox.exists === 0) {
+          console.log(`No messages in ${folder} for ${accountEmail}`);
+          continue;
+        }
+        
+        // Search for emails to this alias, limit to last 2 weeks
+        const twoWeeksAgo = new Date();
+        twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+        
+        const searchCriteria = {
+          to: alias,
+          since: twoWeeksAgo
+        };
+        
+        const search = await client.search(searchCriteria);
+        console.log(`Found ${search.length} messages for ${alias} in ${folder}`);
+        
+        // If no messages found in search, skip to next folder
+        if (search.length === 0) {
+          continue;
+        }
+        
+        // Fetch messages in batches
+        const batchSize = 10;
+        for (let i = 0; i < search.length; i += batchSize) {
+          const batch = search.slice(i, i + batchSize);
+          
+          // Fetch full message data including headers
+          for await (const message of client.fetch(batch, { envelope: true, source: true })) {
+            try {
+              // Deep parse the email
+              const email = await parseImapMessage(message.source.toString(), alias);
+              
+              // Add to cache
+              const cacheKey = `${alias}:${message.uid}`;
+              if (!emailCache.has(cacheKey)) {
+                addToEmailCache(cacheKey, email);
+                totalEmails++;
+                
+                // Notify connected clients about the new email
+                notifyClients(alias, email);
+              }
+            } catch (messageError) {
+              console.error(`Error processing message ${message.uid}:`, messageError);
+            }
+          }
+          
+          // Log progress for large batches
+          if (i + batchSize < search.length) {
+            console.log(`Processed ${i + batchSize}/${search.length} messages for ${alias} in ${folder}`);
+          }
+        }
+      } catch (folderError) {
+        console.error(`Error processing folder ${folder} for ${accountEmail}:`, folderError);
+        // Continue to next folder even if one fails
+      }
+    }
+    
+    console.log(`Fetched a total of ${totalEmails} new emails for ${alias}`);
+    
+    // Update account metrics in database
+    await pool.query(
+      'UPDATE gmail_accounts SET quota_used = quota_used + 1, last_used = NOW(), updated_at = NOW() WHERE email = ?',
+      [accountEmail]
+    );
+    
+  } catch (error) {
+    console.error(`Error fetching emails for alias ${alias}:`, error);
+    throw error;
+  } finally {
+    // Always close non-persistent clients
+    if (client) {
+      try {
+        // Don't wait for logout to complete - just let it happen asynchronously
+        client.logout().catch(err => {
+          console.warn(`Error logging out IMAP client for ${accountEmail}:`, err);
+        });
+      } catch (error) {
+        console.warn(`Error closing IMAP client for ${accountEmail}:`, error);
+      }
+    }
+  }
+}
+
+// Parse an IMAP message using mailparser for better results
+async function parseImapMessage(source, recipientAlias) {
+  try {
+    // Use mailparser to parse the email properly
+    const parsed = await simpleParser(source);
+    
+    // Extract information
+    const from = parsed.from?.text || '';
+    const fromName = parsed.from?.value?.[0]?.name || parsed.from?.value?.[0]?.address?.split('@')[0] || '';
+    const to = recipientAlias;
+    const subject = parsed.subject || '(No Subject)';
+    const bodyHtml = parsed.html || '';
+    const bodyText = parsed.text || '';
+    const date = parsed.date || new Date();
+    
+    // Get attachments info
+    const attachments = parsed.attachments?.map(att => ({
+      filename: att.filename,
+      contentType: att.contentType,
+      size: att.size,
+      // We don't store attachment content in memory, just metadata
+      // In a production app, attachment content would be stored elsewhere
+      contentId: att.contentId,
+      disposition: att.disposition
+    })) || [];
+    
+    // Generate a unique ID based on message ID and date
+    const id = parsed.messageId || `${date.getTime()}-${Math.random().toString(36).substring(2, 10)}`;
+    
+    return {
+      id,
+      threadId: parsed.messageId || id, 
+      from,
+      fromName,
+      to,
+      subject,
+      bodyHtml,
+      bodyText,
+      internalDate: date.toISOString(),
+      timestamp: Date.now(),
+      snippet: bodyText.substring(0, 150).replace(/\s+/g, ' ').trim(),
+      recipientAlias,
+      attachments
+    };
+  } catch (error) {
+    console.error('Error parsing email message:', error);
+    // Fall back to a simple parsing approach if mailparser fails
+    return {
+      id: `fallback-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
+      threadId: `fallback-thread-${Date.now()}`,
+      from: 'error@parsing.email',
+      fromName: 'Error Parsing Email',
+      to: recipientAlias,
+      subject: 'Error Parsing Email',
+      bodyHtml: '',
+      bodyText: 'There was an error parsing this email. Please check your inbox directly.',
+      internalDate: new Date().toISOString(),
+      timestamp: Date.now(),
+      snippet: 'Error parsing email',
+      recipientAlias,
+      attachments: []
+    };
   }
 }
 
@@ -753,93 +952,115 @@ async function pollForNewEmails(accountEmail) {
       
       console.log(`Polling for new emails for account ${accountEmail} with ${accountAliases.length} aliases...`);
       
-      // Get IMAP client with retry logic built-in
-      client = await getImapClient(accountEmail);
+      // Get IMAP client but don't persist it
+      client = await getImapClient(accountEmail, false);
       
-      // Select INBOX with maxRetries
-      const maxRetries = 3;
-      const mailbox = await withRetries(
-        async () => await client.mailboxOpen('INBOX'),
-        maxRetries,
-        `Error opening INBOX for ${accountEmail}`
-      );
+      // Check both INBOX and Spam folders
+      const folders = ['INBOX', '[Gmail]/Spam'];
+      let totalProcessed = 0;
       
-      console.log(`Opened INBOX for ${accountEmail}, message count: ${mailbox.exists}`);
-      
-      // Get the last 20 messages (or fewer if there are fewer)
-      const messageCount = Math.min(mailbox.exists, 20);
-      
-      if (messageCount === 0) {
-        console.log(`No messages in INBOX for ${accountEmail}`);
-        return;
-      }
-      
-      // Fetch the most recent messages
-      const fetchOptions = {
-        uid: true,
-        envelope: true,
-        bodyStructure: true,
-        source: {
-          startFrom: 0,
-          maxLength: 1024 * 1024 // Limit source size to 1MB
-        } 
-      };
-      
-      // Use sequence numbers to get the most recent messages
-      const fetchFrom = Math.max(1, mailbox.exists - messageCount + 1);
-      const fetchRange = `${fetchFrom}:*`;
-      
-      console.log(`Fetching messages ${fetchRange} for ${accountEmail}`);
-      
-      let processedCount = 0;
-      let newEmailsFound = 0;
-      
-      try {
-        // Process each message
-        for await (const message of client.fetch(fetchRange, fetchOptions)) {
-          try {
-            processedCount++;
-            
-            // Check if this message is addressed to any of our aliases
-            const toAddresses = message.envelope.to || [];
-            const recipientAliases = [];
-            
-            for (const to of toAddresses) {
-              const toAddress = to.address.toLowerCase();
-              if (accountAliases.includes(toAddress)) {
-                recipientAliases.push(toAddress);
-              }
-            }
-            
-            if (recipientAliases.length > 0) {
-              // Process for each matching alias
-              for (const recipientAlias of recipientAliases) {
-                console.log(`Found message for alias ${recipientAlias}, UID: ${message.uid}`);
-                
-                // Process the message
-                const processedEmail = processImapMessage(message, recipientAlias);
-                
-                // Add to cache
-                const cacheKey = `${recipientAlias}:${message.uid}`;
-                if (!emailCache.has(cacheKey)) {
-                  addToEmailCache(cacheKey, processedEmail);
-                  console.log(`Added message ${message.uid} to cache for ${recipientAlias}`);
-                  newEmailsFound++;
-                  
-                  // Notify connected clients about the new email (WebSocket)
-                  notifyClients(recipientAlias, processedEmail);
-                }
-              }
-            }
-          } catch (messageError) {
-            console.error(`Error processing message ${message.uid}:`, messageError);
+      for (const folder of folders) {
+        try {
+          // Select the folder with retry
+          const mailbox = await withRetries(
+            async () => await client.mailboxOpen(folder),
+            3,
+            `Error opening ${folder} for ${accountEmail}`
+          );
+          
+          console.log(`Opened ${folder} for ${accountEmail}, message count: ${mailbox.exists}`);
+          
+          if (mailbox.exists === 0) {
+            console.log(`No messages in ${folder} for ${accountEmail}`);
+            continue;
           }
+          
+          // Only fetch the most recent MAX_EMAILS_PER_FETCH messages (or fewer if there are fewer)
+          const messageCount = Math.min(mailbox.exists, MAX_EMAILS_PER_FETCH);
+          
+          // Fetch the most recent messages
+          const fetchOptions = {
+            envelope: true,
+            source: true,
+            uid: true
+          };
+          
+          // Use sequence numbers to get the most recent messages
+          const fetchFrom = Math.max(1, mailbox.exists - messageCount + 1);
+          const fetchRange = `${fetchFrom}:*`;
+          
+          console.log(`Fetching messages ${fetchRange} from ${folder} for ${accountEmail}`);
+          
+          let processedCount = 0;
+          let newEmailsFound = 0;
+          
+          try {
+            // Process each message
+            for await (const message of client.fetch(fetchRange, fetchOptions)) {
+              try {
+                processedCount++;
+                totalProcessed++;
+                
+                // Check if this message is addressed to any of our aliases
+                const toAddresses = message.envelope.to || [];
+                const recipientAliases = [];
+                
+                for (const to of toAddresses) {
+                  const toAddress = (to.address || '').toLowerCase();
+                  if (accountAliases.includes(toAddress)) {
+                    recipientAliases.push(toAddress);
+                  }
+                }
+                
+                // CC addresses too
+                const ccAddresses = message.envelope.cc || [];
+                for (const cc of ccAddresses) {
+                  const ccAddress = (cc.address || '').toLowerCase();
+                  if (accountAliases.includes(ccAddress)) {
+                    recipientAliases.push(ccAddress);
+                  }
+                }
+                
+                if (recipientAliases.length > 0) {
+                  // Process for each matching alias
+                  for (const recipientAlias of recipientAliases) {
+                    // Use mailparser to parse the full message for better results
+                    const email = await parseImapMessage(message.source.toString(), recipientAlias);
+                    
+                    // Add to cache
+                    const cacheKey = `${recipientAlias}:${message.uid}`;
+                    if (!emailCache.has(cacheKey)) {
+                      console.log(`Found email for alias ${recipientAlias}, UID: ${message.uid}`);
+                      addToEmailCache(cacheKey, email);
+                      newEmailsFound++;
+                      
+                      // Notify connected clients about the new email
+                      notifyClients(recipientAlias, email);
+                    }
+                  }
+                }
+                
+                // Log progress for large folders
+                if (processedCount % 25 === 0) {
+                  console.log(`Processed ${processedCount}/${messageCount} messages from ${folder} for ${accountEmail}`);
+                }
+              } catch (messageError) {
+                console.error(`Error processing message ${message.uid || 'unknown'}:`, messageError);
+              }
+            }
+          } catch (fetchError) {
+            console.error(`Error during fetch from ${folder} for ${accountEmail}:`, fetchError);
+            // Continue to next folder even if one fetch fails
+          }
+          
+          console.log(`Processed ${processedCount} messages from ${folder} for ${accountEmail}, found ${newEmailsFound} new emails`);
+        } catch (folderError) {
+          console.error(`Error processing folder ${folder} for ${accountEmail}:`, folderError);
+          // Continue to next folder even if one fails
         }
-      } catch (fetchError) {
-        console.error(`Error during fetch for ${accountEmail}:`, fetchError);
       }
       
-      console.log(`Processed ${processedCount} messages for ${accountEmail}, found ${newEmailsFound} new emails`);
+      console.log(`Completed polling for ${accountEmail}, processed ${totalProcessed} total messages`);
       
       // Update account metrics in database
       await connection.query(
@@ -920,11 +1141,6 @@ async function pollForNewEmails(accountEmail) {
           }
         } catch (forceCloseError) {
           console.warn(`Error force closing IMAP connection for ${accountEmail}:`, forceCloseError);
-        }
-      } finally {
-        // Remove client from map if it's the current one
-        if (imapClients.get(accountEmail) === client) {
-          imapClients.delete(accountEmail);
         }
       }
     }
@@ -1082,65 +1298,6 @@ function schedulePolling(accountEmail) {
   })();
 }
 
-// Process IMAP message into standardized format
-function processImapMessage(message, recipientAlias) {
-  // Extract headers and body from the message source
-  const source = message.source ? message.source.toString() : '';
-  
-  // Extract basic info from envelope
-  const from = message.envelope.from?.[0]?.address || '';
-  const fromName = message.envelope.from?.[0]?.name || from.split('@')[0] || '';
-  const subject = message.envelope.subject || '(No Subject)';
-  
-  // Extract body parts - using a more efficient approach
-  let bodyHtml = '';
-  let bodyText = '';
-  
-  // Simplified extraction for demo purposes
-  // In production, use mailparser for robust parsing
-  if (source) {
-    // Try to extract HTML body
-    const htmlMatch = source.match(/<html[\s\S]*?<\/html>/i);
-    if (htmlMatch) {
-      bodyHtml = htmlMatch[0];
-    }
-    
-    // If no HTML, try to get plain text
-    if (!bodyHtml) {
-      // Find content after headers
-      const bodyMatch = source.match(/\r\n\r\n([\s\S]*?)$/);
-      if (bodyMatch) {
-        bodyText = bodyMatch[1];
-      }
-    }
-  }
-  
-  // Extract attachments (simplified)
-  const attachments = [];
-  
-  // Ensure we have at least some content
-  if (!bodyHtml && !bodyText) {
-    bodyText = "No content available.";
-  }
-  
-  // Format the processed email
-  return {
-    id: message.uid,
-    threadId: message.uid, // IMAP doesn't have thread IDs, so we use UID
-    from,
-    fromName,
-    to: recipientAlias,
-    subject,
-    bodyHtml,
-    bodyText,
-    internalDate: message.envelope.date ? new Date(message.envelope.date).toISOString() : new Date().toISOString(),
-    timestamp: Date.now(),
-    snippet: bodyText.substring(0, 100).replace(/\s+/g, ' ').trim(),
-    recipientAlias,
-    attachments
-  };
-}
-
 // Cache Management with improved efficiency
 function addToEmailCache(key, email) {
   // If cache is at capacity, remove oldest entries
@@ -1191,6 +1348,19 @@ export async function cleanupInactiveAliases() {
   
   if (inMemoryCleanupCount > 0) {
     console.log(`Cleaned up ${inMemoryCleanupCount} inactive aliases from memory cache`);
+  }
+  
+  // Also clean up email cache if it's getting too big
+  if (emailCache.size > MAX_CACHE_SIZE * 0.9) {
+    const now = Date.now();
+    const oldestKeys = [...emailCache.keys()]
+      .map(k => ({ key: k, timestamp: emailCache.get(k).timestamp }))
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .slice(0, Math.ceil(MAX_CACHE_SIZE * 0.3)) // Remove oldest 30% when we're getting full
+      .map(item => item.key);
+    
+    oldestKeys.forEach(key => emailCache.delete(key));
+    console.log(`Cleaned up ${oldestKeys.length} older emails from cache`);
   }
 }
 

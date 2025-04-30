@@ -10,15 +10,21 @@ const aliasCache = new Map(); // Cache for active aliases during runtime
 const activeImapAccounts = new Set(); // Track which accounts are being actively polled
 const imapClients = new Map(); // Store active IMAP clients
 const connectedClients = new Map(); // Map of userId:alias -> Set of websocket connections
+const reconnectionAttempts = new Map(); // Track reconnection attempts for exponential backoff
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
 const ALIAS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds for in-memory cache
+const MAX_RECONNECTION_ATTEMPTS = 10; // Maximum number of reconnection attempts
+const BASE_RECONNECTION_DELAY = 5000; // Base delay for reconnection (5 seconds)
+const MAX_RECONNECTION_DELAY = 30 * 60 * 1000; // Maximum delay (30 minutes)
 const POLLING_INTERVALS = {
   high: 30000,     // 30 seconds for high priority accounts
   medium: 60000,   // 1 minute for medium priority
   low: 180000      // 3 minutes for low priority accounts
 };
+const CONNECTION_TIMEOUT = 60000; // 1 minute timeout for IMAP connections
+const IDLE_TIMEOUT = 540000; // 9 minutes idle timeout (Gmail drops at ~10 min)
 
 // Encryption utilities for password security
 const encryptionKey = process.env.ENCRYPTION_KEY || 'default-encryption-key';
@@ -43,7 +49,28 @@ function decrypt(text) {
 
 // Setup WebSocket Server
 export function setupWebSocketServer(server) {
-  const wss = new WebSocketServer({ server });
+  const wss = new WebSocketServer({ 
+    server,
+    perMessageDeflate: {
+      zlibDeflateOptions: {
+        // See zlib defaults.
+        chunkSize: 1024,
+        memLevel: 7,
+        level: 3
+      },
+      zlibInflateOptions: {
+        chunkSize: 10 * 1024
+      },
+      // Below options specified as default values.
+      clientNoContextTakeover: true, // Defaults to negotiated value.
+      serverNoContextTakeover: true, // Defaults to negotiated value.
+      clientMaxWindowBits: 10, // Defaults to negotiated value.
+      serverMaxWindowBits: 10, // Defaults to negotiated value.
+      // Below options specified as default values.
+      concurrencyLimit: 10, // Limits zlib concurrency for perf.
+      threshold: 1024 // Size (in bytes) below which messages should not be compressed.
+    }
+  });
   
   console.log('WebSocket server created for real-time email updates');
   
@@ -90,7 +117,7 @@ export function setupWebSocketServer(server) {
     // Handle client messages
     ws.on('message', (message) => {
       try {
-        const data = JSON.parse(message);
+        const data = JSON.parse(message.toString());
         
         // Handle ping message to keep connection alive
         if (data.type === 'ping') {
@@ -103,6 +130,21 @@ export function setupWebSocketServer(server) {
         console.error('Invalid WebSocket message:', err);
       }
     });
+    
+    // Handle errors
+    ws.on('error', (err) => {
+      console.error(`WebSocket error for client ${clientKey}:`, err);
+      try {
+        ws.close();
+      } catch (closeErr) {
+        console.error(`Error closing WebSocket for ${clientKey}:`, closeErr);
+      }
+    });
+  });
+  
+  // Handle server errors
+  wss.on('error', (err) => {
+    console.error('WebSocket server error:', err);
   });
   
   // Log websocket stats every 5 minutes
@@ -135,8 +177,12 @@ function notifyClients(alias, email) {
       
       for (const client of clients) {
         if (client.readyState === 1) { // OPEN
-          client.send(payload);
-          console.log(`Notified client ${clientKey} about new email`);
+          try {
+            client.send(payload);
+            console.log(`Notified client ${clientKey} about new email`);
+          } catch (err) {
+            console.error(`Error notifying client ${clientKey}:`, err);
+          }
         }
       }
     }
@@ -198,10 +244,11 @@ export async function addGmailAccount(email, appPassword) {
       
       // Test the IMAP connection to verify credentials
       try {
-        const client = await createImapClient(email);
-        await client.connect();
-        await client.logout();
+        await testImapConnection(email, appPassword);
         console.log(`Successfully verified IMAP connection for ${email}`);
+        
+        // Reset reconnection attempts counter for this account
+        reconnectionAttempts.delete(email);
       } catch (imapError) {
         console.error(`IMAP connection test failed for ${email}:`, imapError);
         throw new Error(`Failed to connect to IMAP server: ${imapError.message}`);
@@ -229,8 +276,55 @@ export async function addGmailAccount(email, appPassword) {
   }
 }
 
-// Create IMAP client for an account
-async function createImapClient(accountEmail) {
+// Test IMAP connection for an account
+async function testImapConnection(email, appPassword) {
+  // Create a temporary client for testing
+  const testClient = new ImapFlow({
+    host: 'imap.gmail.com',
+    port: 993,
+    secure: true,
+    auth: {
+      user: email,
+      pass: appPassword
+    },
+    logger: false,
+    emitLogs: false,
+    timeoutConnection: 30000, // 30 seconds timeout
+    tls: {
+      rejectUnauthorized: true,
+      enableTrace: false
+    }
+  });
+  
+  try {
+    console.log(`Testing IMAP connection for ${email}...`);
+    await testClient.connect();
+    
+    // List mailboxes to verify connection works
+    const mailboxes = await testClient.list();
+    console.log(`IMAP connection test successful for ${email}, found ${mailboxes.length} mailboxes`);
+    
+    // Clean logout
+    await testClient.logout();
+    return true;
+  } catch (error) {
+    console.error(`IMAP connection test failed for ${email}:`, error);
+    // Ensure client is properly closed on error
+    try {
+      if (testClient.authenticated || testClient.usable) {
+        await testClient.logout();
+      } else if (testClient._socket && testClient._socket.writable) {
+        await testClient.close();
+      }
+    } catch (closeError) {
+      console.warn(`Error closing IMAP test client for ${email}:`, closeError);
+    }
+    throw error;
+  }
+}
+
+// Create and get IMAP client for an account
+async function getImapClient(accountEmail) {
   try {
     // Get account from database
     const [accounts] = await pool.query(
@@ -248,6 +342,26 @@ async function createImapClient(accountEmail) {
       throw new Error(`No app password available for ${accountEmail}`);
     }
     
+    // Check if we have an existing client that's usable
+    if (imapClients.has(accountEmail)) {
+      const existingClient = imapClients.get(accountEmail);
+      
+      if (existingClient.usable) {
+        console.log(`Using existing IMAP client for ${accountEmail}`);
+        return existingClient;
+      }
+      
+      // Existing client not usable, close it if needed
+      try {
+        if (existingClient._socket && existingClient._socket.writable) {
+          await existingClient.close();
+        }
+      } catch (closeError) {
+        console.warn(`Error closing unusable IMAP client for ${accountEmail}:`, closeError);
+      }
+    }
+    
+    console.log(`Creating new IMAP client for ${accountEmail}`);
     const appPassword = decrypt(account.app_password);
     
     // Create new IMAP client
@@ -259,23 +373,98 @@ async function createImapClient(accountEmail) {
         user: accountEmail,
         pass: appPassword
       },
-      logger: false, // Set to true for debugging
+      logger: false,
       emitLogs: false,
-      disableAutoIdle: true, // We'll manage IDLE ourselves
-      timeoutConnection: 30000, // 30 seconds connection timeout
-      timeoutIdle: 540000, // 9 minutes idle timeout (Gmail drops at ~10 min)
+      disableAutoIdle: true,
+      timeoutConnection: CONNECTION_TIMEOUT,
+      timeoutIdle: IDLE_TIMEOUT,
       tls: {
-        rejectUnauthorized: true
+        rejectUnauthorized: true,
+        enableTrace: false,
+        minVersion: 'TLSv1.2',
+        maxVersion: 'TLSv1.3'
       }
     });
     
-    // Store the client
-    imapClients.set(accountEmail, client);
+    // Setup event listeners for connection monitoring
+    client.on('error', err => {
+      console.error(`IMAP client error for ${accountEmail}:`, err);
+    });
     
-    return client;
+    client.on('close', () => {
+      console.log(`IMAP connection closed for ${accountEmail}`);
+    });
+    
+    client.on('end', () => {
+      console.log(`IMAP connection ended for ${accountEmail}`);
+    });
+    
+    // Connect to the server
+    try {
+      await client.connect();
+      console.log(`IMAP client connected for ${accountEmail}`);
+      
+      // Store the client
+      imapClients.set(accountEmail, client);
+      
+      // Reset reconnection counter on successful connection
+      reconnectionAttempts.delete(accountEmail);
+      
+      return client;
+    } catch (connectError) {
+      console.error(`Error connecting IMAP client for ${accountEmail}:`, connectError);
+      throw connectError;
+    }
   } catch (error) {
-    console.error(`Error creating IMAP client for ${accountEmail}:`, error);
+    // Implement exponential backoff for reconnection
+    const attempts = reconnectionAttempts.get(accountEmail) || 0;
+    reconnectionAttempts.set(accountEmail, attempts + 1);
+    
+    const backoffDelay = Math.min(
+      MAX_RECONNECTION_DELAY, 
+      BASE_RECONNECTION_DELAY * Math.pow(2, attempts)
+    );
+    
+    console.error(`IMAP client creation error for ${accountEmail} (attempt ${attempts + 1}). Retry in ${backoffDelay/1000} seconds:`, error);
+    
+    if (attempts < MAX_RECONNECTION_ATTEMPTS) {
+      // Schedule retry with backoff
+      console.log(`Will retry IMAP connection for ${accountEmail} in ${backoffDelay/1000} seconds`);
+    } else {
+      console.error(`Max reconnection attempts (${MAX_RECONNECTION_ATTEMPTS}) reached for ${accountEmail}. Marking as auth-error.`);
+      
+      try {
+        await pool.query(
+          'UPDATE gmail_accounts SET status = ?, updated_at = NOW() WHERE email = ?',
+          ['auth-error', accountEmail]
+        );
+      } catch (dbError) {
+        console.error(`Error updating status for ${accountEmail}:`, dbError);
+      }
+    }
+    
     throw error;
+  }
+}
+
+// Safe way to close IMAP client
+async function safelyCloseImapClient(accountEmail) {
+  if (imapClients.has(accountEmail)) {
+    const client = imapClients.get(accountEmail);
+    
+    try {
+      if (client.usable) {
+        await client.logout();
+        console.log(`IMAP client safely logged out for ${accountEmail}`);
+      } else if (client._socket && client._socket.writable) {
+        await client.close();
+        console.log(`IMAP client safely closed for ${accountEmail}`);
+      }
+    } catch (error) {
+      console.warn(`Error closing IMAP client for ${accountEmail}:`, error);
+    } finally {
+      imapClients.delete(accountEmail);
+    }
   }
 }
 
@@ -510,138 +699,192 @@ export async function rotateUserAlias(userId, strategy = 'dot', domain = 'gmail.
 // Email Polling (Background Task) with improved error handling and frequency
 async function pollForNewEmails(accountEmail) {
   let client = null;
+  let hasLock = false;
   
   try {
-    // Get account from database
-    const [accounts] = await pool.query(
-      'SELECT * FROM gmail_accounts WHERE email = ?',
-      [accountEmail]
-    );
+    // Get a database connection to acquire a lock
+    // This prevents multiple instances from polling the same account simultaneously
+    const connection = await pool.getConnection();
     
-    if (accounts.length === 0) {
-      console.log(`Account ${accountEmail} not found, skipping polling`);
-      return;
-    }
-    
-    const account = accounts[0];
-    
-    if (account.status !== 'active') {
-      console.log(`Skipping polling for inactive account ${accountEmail} (status: ${account.status})`);
+    try {
+      // Try to acquire a lock
+      const lockQuery = "SELECT GET_LOCK(?, 10) as lockResult";
+      const lockName = `gmail_poll_lock_${accountEmail.replace(/[@.]/g, '_')}`;
+      const [lockResult] = await connection.query(lockQuery, [lockName]);
       
-      // Only attempt recovery if the account has been inactive for at least 10 minutes
-      // (but not if it's in auth-error state)
-      if (account.status !== 'auth-error') {
-        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
-        if (new Date(account.updated_at) < tenMinutesAgo) {
-          console.log(`Attempting to auto-recover account ${accountEmail}`);
-          await pool.query(
-            'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE id = ?',
-            [account.id]
-          );
+      if (!lockResult || !lockResult[0] || lockResult[0].lockResult !== 1) {
+        console.log(`Could not acquire lock for polling ${accountEmail}, another process may be polling`);
+        return;
+      }
+      
+      hasLock = true;
+      console.log(`Acquired polling lock for ${accountEmail}`);
+      
+      // Get account status from database first
+      const [accounts] = await connection.query(
+        'SELECT * FROM gmail_accounts WHERE email = ?',
+        [accountEmail]
+      );
+      
+      if (accounts.length === 0) {
+        console.log(`Account ${accountEmail} not found, skipping polling`);
+        return;
+      }
+      
+      const account = accounts[0];
+      
+      if (account.status !== 'active') {
+        console.log(`Skipping polling for inactive account ${accountEmail} (status: ${account.status})`);
+        return;
+      }
+      
+      // Get all aliases associated with this account from in-memory cache only
+      const accountAliases = [];
+      for (const [alias, data] of aliasCache.entries()) {
+        if (data.parentAccount === accountEmail) {
+          accountAliases.push(alias);
         }
       }
-      return;
-    }
-    
-    // Get all aliases associated with this account from in-memory cache only
-    const accountAliases = [];
-    for (const [alias, data] of aliasCache.entries()) {
-      if (data.parentAccount === accountEmail) {
-        accountAliases.push(alias);
+      
+      if (accountAliases.length === 0) {
+        console.log(`Skipping polling for ${accountEmail}: no aliases in memory cache`);
+        return;
       }
-    }
-    
-    if (accountAliases.length === 0) {
-      console.log(`Skipping polling for ${accountEmail}: no aliases in memory cache`);
-      return;
-    }
-    
-    console.log(`Polling for new emails for account ${accountEmail} with ${accountAliases.length} aliases...`);
-    
-    // Get or create IMAP client
-    if (imapClients.has(accountEmail) && imapClients.get(accountEmail).usable) {
-      client = imapClients.get(accountEmail);
-    } else {
-      client = await createImapClient(accountEmail);
-      await client.connect();
-    }
-    
-    // Select INBOX
-    const mailbox = await client.mailboxOpen('INBOX');
-    console.log(`Opened INBOX for ${accountEmail}, message count: ${mailbox.exists}`);
-    
-    // Get the last 20 messages (or fewer if there are fewer)
-    const messageCount = Math.min(mailbox.exists, 20);
-    
-    if (messageCount === 0) {
-      console.log(`No messages in INBOX for ${accountEmail}`);
-      return;
-    }
-    
-    // Fetch the most recent messages
-    const fetchOptions = {
-      uid: true,
-      envelope: true,
-      bodyStructure: true,
-      source: true // Get full message source
-    };
-    
-    // Use sequence numbers to get the most recent messages
-    const fetchFrom = Math.max(1, mailbox.exists - messageCount + 1);
-    const fetchRange = `${fetchFrom}:*`;
-    
-    console.log(`Fetching messages ${fetchRange} for ${accountEmail}`);
-    
-    // Process each message
-    for await (const message of client.fetch(fetchRange, fetchOptions)) {
+      
+      console.log(`Polling for new emails for account ${accountEmail} with ${accountAliases.length} aliases...`);
+      
+      // Get IMAP client with retry logic built-in
+      client = await getImapClient(accountEmail);
+      
+      // Select INBOX with maxRetries
+      const maxRetries = 3;
+      const mailbox = await withRetries(
+        async () => await client.mailboxOpen('INBOX'),
+        maxRetries,
+        `Error opening INBOX for ${accountEmail}`
+      );
+      
+      console.log(`Opened INBOX for ${accountEmail}, message count: ${mailbox.exists}`);
+      
+      // Get the last 20 messages (or fewer if there are fewer)
+      const messageCount = Math.min(mailbox.exists, 20);
+      
+      if (messageCount === 0) {
+        console.log(`No messages in INBOX for ${accountEmail}`);
+        return;
+      }
+      
+      // Fetch the most recent messages
+      const fetchOptions = {
+        uid: true,
+        envelope: true,
+        bodyStructure: true,
+        source: {
+          startFrom: 0,
+          maxLength: 1024 * 1024 // Limit source size to 1MB
+        } 
+      };
+      
+      // Use sequence numbers to get the most recent messages
+      const fetchFrom = Math.max(1, mailbox.exists - messageCount + 1);
+      const fetchRange = `${fetchFrom}:*`;
+      
+      console.log(`Fetching messages ${fetchRange} for ${accountEmail}`);
+      
+      let processedCount = 0;
+      let newEmailsFound = 0;
+      
       try {
-        // Check if this message is addressed to any of our aliases
-        const toAddresses = message.envelope.to || [];
-        const recipientAlias = toAddresses.find(addr => 
-          accountAliases.includes(addr.address.toLowerCase())
-        )?.address.toLowerCase();
-        
-        if (recipientAlias) {
-          console.log(`Found message for alias ${recipientAlias}, UID: ${message.uid}`);
-          
-          // Process the message
-          const processedEmail = processImapMessage(message, recipientAlias);
-          
-          // Add to cache
-          const cacheKey = `${recipientAlias}:${message.uid}`;
-          if (!emailCache.has(cacheKey)) {
-            addToEmailCache(cacheKey, processedEmail);
-            console.log(`Added message ${message.uid} to cache for ${recipientAlias}`);
+        // Process each message
+        for await (const message of client.fetch(fetchRange, fetchOptions)) {
+          try {
+            processedCount++;
             
-            // Notify connected clients about the new email (WebSocket)
-            notifyClients(recipientAlias, processedEmail);
+            // Check if this message is addressed to any of our aliases
+            const toAddresses = message.envelope.to || [];
+            const recipientAliases = [];
+            
+            for (const to of toAddresses) {
+              const toAddress = to.address.toLowerCase();
+              if (accountAliases.includes(toAddress)) {
+                recipientAliases.push(toAddress);
+              }
+            }
+            
+            if (recipientAliases.length > 0) {
+              // Process for each matching alias
+              for (const recipientAlias of recipientAliases) {
+                console.log(`Found message for alias ${recipientAlias}, UID: ${message.uid}`);
+                
+                // Process the message
+                const processedEmail = processImapMessage(message, recipientAlias);
+                
+                // Add to cache
+                const cacheKey = `${recipientAlias}:${message.uid}`;
+                if (!emailCache.has(cacheKey)) {
+                  addToEmailCache(cacheKey, processedEmail);
+                  console.log(`Added message ${message.uid} to cache for ${recipientAlias}`);
+                  newEmailsFound++;
+                  
+                  // Notify connected clients about the new email (WebSocket)
+                  notifyClients(recipientAlias, processedEmail);
+                }
+              }
+            }
+          } catch (messageError) {
+            console.error(`Error processing message ${message.uid}:`, messageError);
           }
         }
-      } catch (messageError) {
-        console.error(`Error processing message ${message.uid}:`, messageError);
+      } catch (fetchError) {
+        console.error(`Error during fetch for ${accountEmail}:`, fetchError);
       }
+      
+      console.log(`Processed ${processedCount} messages for ${accountEmail}, found ${newEmailsFound} new emails`);
+      
+      // Update account metrics in database
+      await connection.query(
+        'UPDATE gmail_accounts SET quota_used = quota_used + 1, last_used = NOW(), updated_at = NOW() WHERE id = ?',
+        [account.id]
+      );
+      
+    } finally {
+      // Release the lock regardless of outcome
+      if (hasLock) {
+        const releaseLockQuery = "SELECT RELEASE_LOCK(?) as releaseResult";
+        const lockName = `gmail_poll_lock_${accountEmail.replace(/[@.]/g, '_')}`;
+        const [releaseResult] = await connection.query(releaseLockQuery, [lockName]);
+        
+        if (releaseResult && releaseResult[0] && releaseResult[0].releaseResult === 1) {
+          console.log(`Released polling lock for ${accountEmail}`);
+        } else {
+          console.warn(`Failed to release polling lock for ${accountEmail}`);
+        }
+      }
+      
+      // Release the connection
+      connection.release();
     }
-    
-    // Update account metrics in database
-    await pool.query(
-      'UPDATE gmail_accounts SET quota_used = quota_used + 1, last_used = NOW(), updated_at = NOW() WHERE id = ?',
-      [account.id]
-    );
-    
   } catch (error) {
     console.error(`Error polling Gmail account ${accountEmail}:`, error);
     
     // Update account status in database with more detailed status
     let statusUpdate = 'error';
-    if (error.message?.includes('Invalid credentials') || error.message?.includes('authentication failed')) {
+    if (error.message?.includes('Invalid credentials') || 
+        error.message?.includes('authentication failed') ||
+        error.message?.includes('[AUTH]')) {
       statusUpdate = 'auth-error';
       console.log(`Account ${accountEmail} has invalid credentials - marked as auth-error`);
+      
+      // Remove from active polling immediately
+      activeImapAccounts.delete(accountEmail);
     } else if (error.message?.includes('quota') || error.message?.includes('rate limit')) {
       statusUpdate = 'rate-limited';
       console.log(`Account ${accountEmail} is rate limited`);
-    } else if (error.message?.includes('network') || error.message?.includes('timeout')) {
+    } else if (error.message?.includes('network') || 
+               error.message?.includes('timeout') || 
+               error.message?.includes('connection')) {
       statusUpdate = 'network-error';
-      console.log(`Network error with account ${accountEmail} - will retry`);
+      console.log(`Network error with account ${accountEmail} - will retry with backoff`);
     }
     
     try {
@@ -650,45 +893,118 @@ async function pollForNewEmails(accountEmail) {
         [statusUpdate, accountEmail]
       );
       
-      // Attempt auto-recovery for certain types of errors
-      if (statusUpdate !== 'auth-error') {
-        // Schedule a retry after a delay
-        setTimeout(async () => {
-          try {
-            console.log(`Attempting auto-recovery for ${accountEmail}...`);
-            await pool.query(
-              'UPDATE gmail_accounts SET status = \'active\', updated_at = NOW() WHERE email = ?',
-              [accountEmail]
-            );
-            
-            // Restart polling for this account
-            if (!activeImapAccounts.has(accountEmail)) {
-              console.log(`Restarting polling for recovered account ${accountEmail}`);
-              schedulePolling(accountEmail);
-              activeImapAccounts.add(accountEmail);
-            }
-          } catch (retryError) {
-            console.error(`Failed to auto-recover ${accountEmail}:`, retryError);
-          }
-        }, 15 * 60 * 1000); // Try to recover after 15 minutes
-      } else {
-        // Remove from active polling if it's an auth error
-        activeImapAccounts.delete(accountEmail);
-        console.log(`Removed ${accountEmail} from active polling due to auth error`);
-      }
+      // Implement exponential backoff for reconnection
+      handlePollingError(accountEmail, statusUpdate);
+      
     } catch (dbError) {
       console.error('Error updating account status:', dbError);
     }
   } finally {
-    // Close the connection if it's open
-    if (client && client.usable) {
+    // Close the IMAP connection properly if it's still open
+    if (client) {
       try {
-        await client.logout();
+        // Close connection with max wait of 5 seconds to avoid hanging
+        const closePromise = client.logout();
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('IMAP logout timeout')), 5000)
+        );
+        
+        await Promise.race([closePromise, timeoutPromise]);
       } catch (logoutError) {
-        console.error(`Error logging out IMAP client for ${accountEmail}:`, logoutError);
+        console.warn(`Error during IMAP logout for ${accountEmail}:`, logoutError);
+        
+        // Force close if logout fails
+        try {
+          if (client._socket && client._socket.writable) {
+            await client.close();
+          }
+        } catch (forceCloseError) {
+          console.warn(`Error force closing IMAP connection for ${accountEmail}:`, forceCloseError);
+        }
+      } finally {
+        // Remove client from map if it's the current one
+        if (imapClients.get(accountEmail) === client) {
+          imapClients.delete(accountEmail);
+        }
       }
     }
   }
+}
+
+// Error handling with exponential backoff
+function handlePollingError(accountEmail, statusType) {
+  if (statusType === 'auth-error') {
+    // Remove from active polling completely for auth errors
+    activeImapAccounts.delete(accountEmail);
+    console.log(`Removed ${accountEmail} from active polling due to auth error`);
+    return;
+  }
+  
+  // Get current attempt count or start at 0
+  const attempts = reconnectionAttempts.get(accountEmail) || 0;
+  
+  // Increment attempt counter
+  reconnectionAttempts.set(accountEmail, attempts + 1);
+  
+  // Calculate delay with exponential backoff and jitter
+  // Base delay * 2^attempts + random jitter of up to 30%
+  const baseDelay = BASE_RECONNECTION_DELAY * Math.pow(2, Math.min(attempts, 8));
+  const jitter = Math.random() * 0.3 * baseDelay;
+  const delay = Math.min(MAX_RECONNECTION_DELAY, baseDelay + jitter);
+  
+  console.log(`Scheduling retry #${attempts + 1} for ${accountEmail} in ${Math.round(delay / 1000)} seconds`);
+  
+  setTimeout(() => {
+    if (activeImapAccounts.has(accountEmail)) {
+      console.log(`Attempting retry #${attempts + 1} for ${accountEmail}`);
+      
+      // If we're at max attempts, mark account as inactive but keep trying at a slow rate
+      if (attempts >= MAX_RECONNECTION_ATTEMPTS) {
+        console.log(`Max retry attempts (${MAX_RECONNECTION_ATTEMPTS}) reached for ${accountEmail}, reducing frequency`);
+        
+        // Don't give up entirely, just slow down dramatically
+        setTimeout(() => {
+          // Reset attempt counter after a long break
+          reconnectionAttempts.set(accountEmail, Math.floor(MAX_RECONNECTION_ATTEMPTS / 2));
+          
+          if (activeImapAccounts.has(accountEmail)) {
+            console.log(`Attempting recovery polling for ${accountEmail} after cooling off`);
+            pollForNewEmails(accountEmail).catch(error => 
+              console.error(`Recovery polling attempt for ${accountEmail} failed:`, error)
+            );
+          }
+        }, MAX_RECONNECTION_DELAY); // Try again after max delay
+      } else {
+        // Normal retry
+        pollForNewEmails(accountEmail).catch(error => 
+          console.error(`Retry attempt for ${accountEmail} failed:`, error)
+        );
+      }
+    }
+  }, delay);
+}
+
+// Function to retry an operation with exponential backoff
+async function withRetries(operation, maxRetries = 3, errorMsg = 'Operation failed') {
+  let lastError;
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      
+      if (attempt < maxRetries) {
+        const delay = BASE_RECONNECTION_DELAY * Math.pow(2, attempt);
+        console.log(`${errorMsg}. Retrying in ${delay/1000}s (attempt ${attempt + 1}/${maxRetries})`);
+        
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  // If we get here, all retries failed
+  throw new Error(`${errorMsg} after ${maxRetries} attempts: ${lastError?.message}`);
 }
 
 function schedulePolling(accountEmail) {
@@ -737,14 +1053,21 @@ function schedulePolling(accountEmail) {
         console.log(`Added ${accountEmail} to active polling accounts`);
       }
       
-      // Start with an immediate poll, then schedule recurring
-      pollForNewEmails(accountEmail).catch(error => 
-        console.error(`Initial poll for ${accountEmail} failed:`, error)
-      );
+      // Handle existing retries
+      const runPollingNow = !reconnectionAttempts.has(accountEmail) || 
+                          reconnectionAttempts.get(accountEmail) < 3;
+      
+      if (runPollingNow) {
+        // Start with an immediate poll, then schedule recurring
+        pollForNewEmails(accountEmail).catch(error => {
+          console.error(`Initial poll for ${accountEmail} failed:`, error);
+          // Error handled in pollForNewEmails
+        });
+      }
       
       // Schedule next poll
       setTimeout(() => {
-        // Only schedule next poll if account is still in active set and polling should continue
+        // Only schedule next poll if account is still in active set
         if (activeImapAccounts.has(accountEmail)) {
           schedulePolling(accountEmail);
         } else {
@@ -762,47 +1085,43 @@ function schedulePolling(accountEmail) {
 // Process IMAP message into standardized format
 function processImapMessage(message, recipientAlias) {
   // Extract headers and body from the message source
-  const source = message.source.toString();
+  const source = message.source ? message.source.toString() : '';
   
   // Extract basic info from envelope
   const from = message.envelope.from?.[0]?.address || '';
-  const fromName = message.envelope.from?.[0]?.name || '';
+  const fromName = message.envelope.from?.[0]?.name || from.split('@')[0] || '';
   const subject = message.envelope.subject || '(No Subject)';
   
-  // Extract body parts
+  // Extract body parts - using a more efficient approach
   let bodyHtml = '';
   let bodyText = '';
   
-  // Simple parsing of multipart messages
-  // In a real implementation, you'd use a proper email parser like mailparser
-  const boundaryMatch = source.match(/boundary="([^"]+)"/);
-  if (boundaryMatch) {
-    const boundary = boundaryMatch[1];
-    const parts = source.split(`--${boundary}`);
-    
-    for (const part of parts) {
-      if (part.includes('Content-Type: text/html')) {
-        const bodyMatch = part.match(/\r\n\r\n([\s\S]*?)(\r\n--|\r\n$)/);
-        if (bodyMatch) {
-          bodyHtml = bodyMatch[1];
-        }
-      } else if (part.includes('Content-Type: text/plain')) {
-        const bodyMatch = part.match(/\r\n\r\n([\s\S]*?)(\r\n--|\r\n$)/);
-        if (bodyMatch) {
-          bodyText = bodyMatch[1];
-        }
-      }
+  // Simplified extraction for demo purposes
+  // In production, use mailparser for robust parsing
+  if (source) {
+    // Try to extract HTML body
+    const htmlMatch = source.match(/<html[\s\S]*?<\/html>/i);
+    if (htmlMatch) {
+      bodyHtml = htmlMatch[0];
     }
-  } else {
-    // Simple non-multipart message
-    const bodyMatch = source.match(/\r\n\r\n([\s\S]*?)$/);
-    if (bodyMatch) {
-      bodyText = bodyMatch[1];
+    
+    // If no HTML, try to get plain text
+    if (!bodyHtml) {
+      // Find content after headers
+      const bodyMatch = source.match(/\r\n\r\n([\s\S]*?)$/);
+      if (bodyMatch) {
+        bodyText = bodyMatch[1];
+      }
     }
   }
   
   // Extract attachments (simplified)
   const attachments = [];
+  
+  // Ensure we have at least some content
+  if (!bodyHtml && !bodyText) {
+    bodyText = "No content available.";
+  }
   
   // Format the processed email
   return {
@@ -816,7 +1135,7 @@ function processImapMessage(message, recipientAlias) {
     bodyText,
     internalDate: message.envelope.date ? new Date(message.envelope.date).toISOString() : new Date().toISOString(),
     timestamp: Date.now(),
-    snippet: bodyText.substring(0, 100),
+    snippet: bodyText.substring(0, 100).replace(/\s+/g, ' ').trim(),
     recipientAlias,
     attachments
   };
@@ -1014,48 +1333,6 @@ async function getNextAvailableAccount() {
   }
 }
 
-// Function to force check and update all accounts
-export async function forceCheckAllAccounts() {
-  console.log("Performing forced check of all Gmail accounts...");
-  
-  try {
-    // Get all accounts from the database
-    const [allAccounts] = await pool.query(`SELECT * FROM gmail_accounts`);
-    
-    console.log(`Found ${allAccounts.length} Gmail accounts to check`);
-    
-    for (const account of allAccounts) {
-      const accountEmail = account.email;
-      
-      // If account is active but not being polled, start polling
-      if (account.status === 'active' && !activeImapAccounts.has(accountEmail)) {
-        console.log(`Starting polling for active account ${accountEmail} that wasn't being polled`);
-        schedulePolling(accountEmail);
-        activeImapAccounts.add(accountEmail);
-      }
-      // If account is inactive but being polled, stop polling
-      else if (account.status !== 'active' && activeImapAccounts.has(accountEmail)) {
-        console.log(`Removing inactive account ${accountEmail} from polling`);
-        activeImapAccounts.delete(accountEmail);
-      }
-    }
-    
-    // Log account status
-    console.log(`After check: ${activeImapAccounts.size} accounts actively polling`);
-    return {
-      totalAccounts: allAccounts.length,
-      activelyPolling: activeImapAccounts.size,
-      pollingAccounts: Array.from(activeImapAccounts)
-    };
-  } catch (error) {
-    console.error("Error performing forced account check:", error);
-    throw error;
-  }
-}
-
-// Check all accounts every 30 minutes to catch any polling issues
-setInterval(forceCheckAllAccounts, 30 * 60 * 1000);
-
 // Admin functions
 export async function getGmailAccountStats() {
   try {
@@ -1142,6 +1419,26 @@ export async function initializeImapService() {
         activeImapAccounts.add(account.email);
       }
     }
+    
+    // Set up a cleanup interval for IMAP clients
+    setInterval(async () => {
+      try {
+        // Clean up any stale IMAP clients
+        for (const [email, client] of imapClients.entries()) {
+          // Check if account is still active
+          if (!activeImapAccounts.has(email)) {
+            console.log(`Cleaning up IMAP client for inactive account ${email}`);
+            await safelyCloseImapClient(email);
+          } else if (client._connectionTimeout) {
+            // Client has a connection timeout, try to clean it up
+            console.log(`Cleaning up IMAP client with connection timeout for ${email}`);
+            await safelyCloseImapClient(email);
+          }
+        }
+      } catch (error) {
+        console.error('Error during IMAP client cleanup:', error);
+      }
+    }, 10 * 60 * 1000); // Run every 10 minutes
     
     console.log('IMAP service initialized successfully');
     return true;

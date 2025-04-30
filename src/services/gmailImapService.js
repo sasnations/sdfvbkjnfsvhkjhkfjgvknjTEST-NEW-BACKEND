@@ -17,6 +17,7 @@ const reconnectionAttempts = new Map(); // Track reconnection attempts for expon
 const userAccountAssignments = new Map(); // Track which account is assigned to which user
 const accountUserCounts = new Map(); // Track how many users are assigned to each account
 const pendingDbUpdates = new Map(); // Track pending database updates to batch them
+const emailFetchCache = new Map(); // Track when we last fetched for an alias
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
@@ -29,9 +30,10 @@ const POLLING_INTERVALS = {
   medium: 60000,   // 1 minute for medium priority
   low: 180000      // 3 minutes for low priority accounts
 };
-const CONNECTION_TIMEOUT = 60000; // 1 minute timeout for IMAP connections
+const CONNECTION_TIMEOUT = 30000; // 30 seconds timeout for IMAP connections
 const IDLE_TIMEOUT = 540000; // 9 minutes idle timeout (Gmail drops at ~10 min)
-const MAX_EMAILS_PER_FETCH = 50; // Maximum number of emails to fetch at once
+const MAX_EMAILS_PER_FETCH = 20; // Maximum number of emails to fetch at once
+const CONNECTION_POOL_LIMIT = 5; // Maximum number of concurrent connections
 
 // Set the interval for batch DB updates
 const DB_UPDATE_INTERVAL = 10 * 60 * 1000; // 10 minutes
@@ -109,6 +111,19 @@ export function setupWebSocketServer(server) {
       timestamp: new Date().toISOString(),
       alias
     }));
+    
+    // Immediately trigger a fresh fetch for this alias
+    if (aliasCache.has(alias)) {
+      const data = aliasCache.get(alias);
+      if (data.parentAccount) {
+        // Schedule immediate fetch (don't await)
+        setTimeout(() => {
+          fetchEmailsForAlias(data.parentAccount, alias).catch(error => {
+            console.error(`Error fetching emails for ${alias}:`, error);
+          });
+        }, 100);
+      }
+    }
     
     // Handle client disconnect
     ws.on('close', () => {
@@ -333,9 +348,29 @@ async function testImapConnection(email, appPassword) {
   }
 }
 
-// Create and get IMAP client for an account
+// Connection pool management - reuse connections where possible
 async function getImapClient(accountEmail, persistConnection = true) {
   try {
+    // Check if we're at connection pool limit
+    if (imapClients.size >= CONNECTION_POOL_LIMIT && !imapClients.has(accountEmail)) {
+      // Find least recently used client to close
+      let oldestClient = null;
+      let oldestTime = Infinity;
+      
+      for (const [email, client] of imapClients.entries()) {
+        if (client._lastUsed && client._lastUsed < oldestTime) {
+          oldestClient = email;
+          oldestTime = client._lastUsed;
+        }
+      }
+      
+      // Close oldest client if found
+      if (oldestClient) {
+        console.log(`Connection pool limit reached, closing oldest client: ${oldestClient}`);
+        await safelyCloseImapClient(oldestClient);
+      }
+    }
+    
     // Get account from database
     const [accounts] = await pool.query(
       'SELECT * FROM gmail_accounts WHERE email = ?',
@@ -357,9 +392,13 @@ async function getImapClient(accountEmail, persistConnection = true) {
       const existingClient = imapClients.get(accountEmail);
       
       if (existingClient.usable) {
+        // Update last used timestamp
+        existingClient._lastUsed = Date.now();
+        
         // Perform a no-op to check that the connection is still active
         try {
           await existingClient.noop();
+          console.log(`Reusing existing IMAP connection for ${accountEmail}`);
           return existingClient;
         } catch (noopError) {
           console.warn(`NOOP failed for ${accountEmail}, recreating connection`);
@@ -381,7 +420,7 @@ async function getImapClient(accountEmail, persistConnection = true) {
     console.log(`Creating new IMAP client for ${accountEmail}`);
     const appPassword = decrypt(account.app_password);
     
-    // Create new IMAP client
+    // Create new IMAP client with optimized settings
     const client = new ImapFlow({
       host: 'imap.gmail.com',
       port: 993,
@@ -402,6 +441,9 @@ async function getImapClient(accountEmail, persistConnection = true) {
         maxVersion: 'TLSv1.3'
       }
     });
+    
+    // Add last used timestamp
+    client._lastUsed = Date.now();
     
     // Setup event listeners for connection monitoring
     client.on('error', err => {
@@ -496,8 +538,12 @@ async function flushPendingDbUpdates() {
       const values = [];
       
       for (const [field, value] of updates.entries()) {
-        fields.push(`${field} = ?`);
-        values.push(value);
+        if (field === 'last_used' && value === 'NOW()') {
+          fields.push(`${field} = NOW()`);
+        } else {
+          fields.push(`${field} = ?`);
+          values.push(value);
+        }
       }
       
       // Always update the timestamp
@@ -683,7 +729,7 @@ function generatePlusAlias(email, domain = 'gmail.com') {
   return `${username}+${tag}@${domain}`;
 }
 
-// Faster email fetching with improved caching
+// Faster email fetching with improved caching and connection reuse
 export async function fetchGmailEmails(userId, aliasEmail) {
   console.log(`Fetching emails for ${aliasEmail}, requested by user ${userId || 'anonymous'}`);
   
@@ -760,17 +806,25 @@ export async function fetchGmailEmails(userId, aliasEmail) {
       }
     }
     
-    // If we have very few emails in cache or cache is stale, trigger a background fetch
-    const shouldFetchInBackground = cachedEmails.length < 5 || 
-      (cachedEmails.length > 0 && Date.now() - cachedEmails[0].timestamp > 60000); // 1 minute stale
+    // Determine if we need a background fetch
+    const lastFetchTime = emailFetchCache.get(aliasEmail) || 0;
+    const timeSinceLastFetch = Date.now() - lastFetchTime;
+    const needsFetch = timeSinceLastFetch > 30000; // 30 seconds since last fetch
     
-    if (shouldFetchInBackground) {
-      console.log(`${cachedEmails.length} emails in cache for ${aliasEmail}, triggering background fetch`);
+    // If we need a fetch, set the last fetch time now to prevent duplicate fetches
+    if (needsFetch) {
+      emailFetchCache.set(aliasEmail, Date.now());
       
-      // Don't await - fetch in background
-      fetchEmailsForAlias(parentAccount, aliasEmail).catch(error => {
-        console.error(`Background fetch failed for ${aliasEmail}:`, error);
-      });
+      // Trigger background fetch without waiting for it
+      setTimeout(() => {
+        fetchEmailsForAlias(parentAccount, aliasEmail).catch(error => {
+          console.error(`Background fetch failed for ${aliasEmail}:`, error);
+          // Reset fetch time on error so we can try again soon
+          emailFetchCache.set(aliasEmail, Date.now() - 25000);
+        });
+      }, 0);
+      
+      console.log(`Triggered background fetch for ${aliasEmail}`);
     }
     
     // Return cached emails sorted by date (newest first)
@@ -790,67 +844,79 @@ async function fetchEmailsForAlias(accountEmail, alias) {
   let client = null;
   
   try {
-    // Get IMAP client - don't persist this one-time fetch client
-    client = await getImapClient(accountEmail, false);
+    // Get IMAP client with connection pooling
+    client = await getImapClient(accountEmail, true);
     
-    // Keep track of the last fetch time for this alias
-    const lastFetchKey = `last_fetch_${alias}`;
-    const lastFetchTime = globalThis[lastFetchKey] || new Date(0);
+    // Store last time we checked for emails for this alias
+    const lastFetchKey = `${alias}_last_fetch`;
+    // Default to 2 days ago if never fetched before
+    const twoDaysAgo = new Date();
+    twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+    const lastCheckedTime = global[lastFetchKey] || twoDaysAgo;
     
-    // Look in both INBOX and Spam folders, but only fetch new messages since last check
+    // Look in both INBOX and Spam folders
     const folders = ['INBOX', '[Gmail]/Spam'];
-    let totalEmails = 0;
+    let newEmailCount = 0;
     
     for (const folder of folders) {
       try {
         console.log(`Searching ${folder} for emails to ${alias}...`);
         
-        // Select the mailbox
-        const mailbox = await client.mailboxOpen(folder);
+        // Select the mailbox with retries
+        let mailbox;
+        try {
+          mailbox = await client.mailboxOpen(folder);
+        } catch (openError) {
+          console.error(`Error opening mailbox ${folder}:`, openError);
+          // Try once more with a new connection
+          await safelyCloseImapClient(accountEmail);
+          client = await getImapClient(accountEmail, true);
+          mailbox = await client.mailboxOpen(folder);
+        }
+        
         console.log(`Opened ${folder} for ${accountEmail}, message count: ${mailbox.exists}`);
         
         // If no messages, skip to next folder
         if (mailbox.exists === 0) {
-          console.log(`No messages in ${folder} for ${accountEmail}`);
           continue;
         }
         
-        // Search for emails to this alias, only since last fetch
+        // Search for emails to this alias since last check
         const searchCriteria = {
           to: alias,
-          since: lastFetchTime
+          since: lastCheckedTime
         };
         
         const search = await client.search(searchCriteria);
-        console.log(`Found ${search.length} new messages for ${alias} in ${folder} since ${lastFetchTime.toISOString()}`);
+        console.log(`Found ${search.length} new messages for ${alias} in ${folder} since ${lastCheckedTime.toISOString()}`);
         
-        // If no messages found in search, skip to next folder
         if (search.length === 0) {
           continue;
         }
         
-        // Fetch messages in smaller batches to reduce memory usage and improve speed
-        const batchSize = 5; // Smaller batch size for faster responses
+        // Process messages in small batches for better responsiveness
+        const batchSize = 5;
         for (let i = 0; i < search.length; i += batchSize) {
           const batch = search.slice(i, i + batchSize);
           
-          // Fetch only headers first, then body on demand
-          for await (const message of client.fetch(batch, { envelope: true })) {
+          for await (const message of client.fetch(batch, { envelope: true, source: true, uid: true })) {
             try {
-              // First check if the message is actually addressed to our alias
-              const toAddresses = message.envelope.to.map(to => to.address.toLowerCase());
-              if (toAddresses.includes(alias.toLowerCase())) {
-                // Now fetch the full message body
-                const fullMessage = await client.fetchOne(message.uid, { source: true });
+              // Verify this message is actually addressed to our alias
+              const recipients = message.envelope.to || [];
+              const isForAlias = recipients.some(to => 
+                to.address?.toLowerCase() === alias.toLowerCase()
+              );
+              
+              if (isForAlias) {
+                // Parse the email
+                const email = await parseImapMessage(message.source.toString(), alias);
                 
-                // Parse the email (optimized)
-                const email = await parseImapMessage(fullMessage.source.toString(), alias);
-                
-                // Add to cache
+                // Add to cache with message UID as part of the key for uniqueness
                 const cacheKey = `${alias}:${message.uid}`;
+                
                 if (!emailCache.has(cacheKey)) {
                   addToEmailCache(cacheKey, email);
-                  totalEmails++;
+                  newEmailCount++;
                   
                   // Notify connected clients about the new email
                   notifyClients(alias, email);
@@ -867,31 +933,21 @@ async function fetchEmailsForAlias(accountEmail, alias) {
       }
     }
     
-    // Update the last fetch time
-    globalThis[lastFetchKey] = new Date();
+    // Update last check time for this alias
+    global[`${alias}_last_fetch`] = new Date();
     
-    console.log(`Fetched a total of ${totalEmails} new emails for ${alias}`);
+    console.log(`Found ${newEmailCount} new emails for ${alias}`);
     
-    // Add to pending DB updates instead of immediate update
-    if (totalEmails > 0) {
-      addPendingDbUpdate(accountEmail, 'quota_used', parseInt(accountEmail.quota_used || 0) + 1);
+    // Update account usage in batch DB updates if we found emails
+    if (newEmailCount > 0) {
+      addPendingDbUpdate(accountEmail, 'quota_used', account.quota_used + 1);
     }
     
   } catch (error) {
     console.error(`Error fetching emails for alias ${alias}:`, error);
     throw error;
   } finally {
-    // Always close non-persistent clients
-    if (client) {
-      try {
-        // Don't wait for logout to complete - just let it happen asynchronously
-        client.logout().catch(err => {
-          console.warn(`Error logging out IMAP client for ${accountEmail}:`, err);
-        });
-      } catch (error) {
-        console.warn(`Error closing IMAP client for ${accountEmail}:`, error);
-      }
-    }
+    // Don't close the client as it's reused through the connection pool
   }
 }
 
@@ -1025,6 +1081,11 @@ export async function rotateUserAlias(userId, strategy = 'dot', domain = 'gmail.
 
 // Improved email polling with more efficient searching and better error handling
 async function pollForNewEmails(accountEmail) {
+  if (imapClients.size >= CONNECTION_POOL_LIMIT) {
+    console.log(`Skipping poll for ${accountEmail}: connection pool limit reached (${imapClients.size}/${CONNECTION_POOL_LIMIT})`);
+    return;
+  }
+  
   let client = null;
   
   try {
@@ -1042,8 +1103,8 @@ async function pollForNewEmails(accountEmail) {
       return;
     }
     
-    // Get IMAP client but don't persist it
-    client = await getImapClient(accountEmail, false);
+    // Get IMAP client from connection pool
+    client = await getImapClient(accountEmail, true);
     
     // Check both INBOX and Spam folders
     const folders = ['INBOX', '[Gmail]/Spam'];
@@ -1070,14 +1131,13 @@ async function pollForNewEmails(accountEmail) {
         await client.mailboxOpen(folder);
         console.log(`Opened ${folder} for ${accountEmail}`);
         
-        // Instead of searching for ALL emails (slow), search for recent ones
-        // This significantly reduces fetch time
-        const oneDayAgo = new Date();
-        oneDayAgo.setDate(oneDayAgo.getDate() - 1);
+        // For better performance, only check messages from the last hour
+        const oneHourAgo = new Date();
+        oneHourAgo.setHours(oneHourAgo.getHours() - 1);
         
-        // Get messages newer than 1 day
-        const messages = await client.search({ since: oneDayAgo });
-        console.log(`Found ${messages.length} messages from last 24 hours in ${folder}`);
+        // Get messages newer than 1 hour
+        const messages = await client.search({ since: oneHourAgo });
+        console.log(`Found ${messages.length} messages from last hour in ${folder}`);
         
         if (messages.length === 0) continue;
         
@@ -1132,7 +1192,6 @@ async function pollForNewEmails(accountEmail) {
     }
     
     // Add to pending quota update instead of immediate DB update
-    addPendingDbUpdate(accountEmail, 'quota_used', parseInt(accountEmail.quota_used || 0) + 1);
     addPendingDbUpdate(accountEmail, 'last_used', 'NOW()');
     
   } catch (error) {
@@ -1153,20 +1212,11 @@ async function pollForNewEmails(accountEmail) {
     }
     
     // Force a DB update soon for error conditions
-    setTimeout(flushPendingDbUpdates, 10000);
-  } finally {
-    // Close the IMAP connection properly if it's still open
-    if (client) {
-      try {
-        await client.logout();
-      } catch (logoutError) {
-        console.warn(`Error during IMAP logout for ${accountEmail}:`, logoutError);
-      }
-    }
+    setTimeout(flushPendingDbUpdates, 5000);
   }
 }
 
-// Set up polling schedule with dynamic intervals
+// Set up polling schedule with dynamic intervals based on activity
 function schedulePolling(accountEmail) {
   console.log(`Setting up polling schedule for ${accountEmail}`);
   
@@ -1205,6 +1255,8 @@ function schedulePolling(accountEmail) {
       } else {
         interval = POLLING_INTERVALS.low;
       }
+      
+      console.log(`Using polling interval of ${interval}ms for ${accountEmail}`);
       
       // Start with an initial poll (don't await - let it run in background)
       pollForNewEmails(accountEmail).catch(error => {
@@ -1452,6 +1504,23 @@ export async function initializeImapService() {
     
     // Start the periodic DB update flush
     setInterval(flushPendingDbUpdates, DB_UPDATE_INTERVAL);
+    
+    // Start the connection pool maintenance
+    setInterval(async () => {
+      console.log(`IMAP connection pool maintenance: ${imapClients.size}/${CONNECTION_POOL_LIMIT} connections active`);
+      
+      // Check for idle connections
+      for (const [email, client] of imapClients.entries()) {
+        // Close connections that are too old
+        if (client._lastUsed && (Date.now() - client._lastUsed) > IDLE_TIMEOUT) {
+          console.log(`Closing idle connection for ${email}`);
+          await safelyCloseImapClient(email);
+        }
+      }
+    }, 2 * 60 * 1000); // Run every 2 minutes
+    
+    // Clean up inactive aliases periodically
+    setInterval(cleanupInactiveAliases, 60 * 60 * 1000); // Every hour
     
     // Start polling for all active accounts
     for (const account of accounts) {

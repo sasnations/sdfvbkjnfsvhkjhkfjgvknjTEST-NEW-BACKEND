@@ -1,5 +1,6 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import { pool } from '../db/init.js';
 import { authenticateToken, requireAdmin, authenticateMasterPassword } from '../middleware/auth.js';
 import { 
   addGmailAccount, 

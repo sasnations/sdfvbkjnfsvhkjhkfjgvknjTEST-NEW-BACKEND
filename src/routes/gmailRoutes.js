@@ -9,10 +9,7 @@ import {
   rotateUserAlias,
   getGmailAccountStats,
   getEmailCacheStats,
-  initializeImapService,
-  updateGmailAccount,
-  deleteGmailAccount,
-  toggleAccountStatus
+  initializeImapService
 } from '../services/gmailImapService.js';
 
 const router = express.Router();
@@ -231,85 +228,6 @@ router.post('/admin/accounts-alt', async (req, res) => {
     console.error('Failed to add Gmail account:', error);
     res.status(400).json({ 
       error: error.message || 'Failed to add Gmail account',
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-});
-
-// Update Gmail account app password
-router.patch('/admin/accounts/:id', async (req, res) => {
-  try {
-    // Check admin passphrase
-    const adminAccess = req.headers['admin-access'];
-    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    const { id } = req.params;
-    const { appPassword } = req.body;
-    
-    if (!appPassword) {
-      return res.status(400).json({ error: 'App password is required' });
-    }
-    
-    const result = await updateGmailAccount(id, { appPassword });
-    
-    res.json(result);
-  } catch (error) {
-    console.error('Failed to update Gmail account:', error);
-    res.status(400).json({ 
-      error: error.message || 'Failed to update Gmail account',
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-});
-
-// Delete Gmail account
-router.delete('/admin/accounts/:id', async (req, res) => {
-  try {
-    // Check admin passphrase
-    const adminAccess = req.headers['admin-access'];
-    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    const { id } = req.params;
-    
-    const result = await deleteGmailAccount(id);
-    
-    res.json(result);
-  } catch (error) {
-    console.error('Failed to delete Gmail account:', error);
-    res.status(400).json({ 
-      error: error.message || 'Failed to delete Gmail account',
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
-  }
-});
-
-// Toggle Gmail account status (active/inactive)
-router.patch('/admin/accounts/:id/status', async (req, res) => {
-  try {
-    // Check admin passphrase
-    const adminAccess = req.headers['admin-access'];
-    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    const { id } = req.params;
-    const { status } = req.body;
-    
-    if (!status || !['active', 'inactive'].includes(status)) {
-      return res.status(400).json({ error: 'Valid status (active/inactive) is required' });
-    }
-    
-    const result = await toggleAccountStatus(id, status);
-    
-    res.json(result);
-  } catch (error) {
-    console.error('Failed to update account status:', error);
-    res.status(400).json({ 
-      error: error.message || 'Failed to update account status',
       details: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }

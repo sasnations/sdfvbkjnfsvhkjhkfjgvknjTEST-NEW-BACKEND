@@ -233,6 +233,136 @@ router.post('/admin/accounts-alt', async (req, res) => {
   }
 });
 
+// Update Gmail account (update app password)
+router.patch('/admin/accounts/:accountId', async (req, res) => {
+  try {
+    // Check admin passphrase
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const { accountId } = req.params;
+    const { appPassword } = req.body;
+    
+    if (!appPassword) {
+      return res.status(400).json({ error: 'App password is required' });
+    }
+    
+    // Check if account exists
+    const [accounts] = await pool.query(
+      'SELECT id FROM gmail_accounts WHERE id = ?',
+      [accountId]
+    );
+    
+    if (accounts.length === 0) {
+      return res.status(404).json({ error: 'Gmail account not found' });
+    }
+    
+    // Update the app password
+    await pool.query(
+      'UPDATE gmail_accounts SET app_password = ?, updated_at = NOW() WHERE id = ?',
+      [appPassword, accountId]
+    );
+    
+    res.json({ message: 'Gmail account password updated successfully' });
+  } catch (error) {
+    console.error('Failed to update Gmail account:', error);
+    res.status(400).json({ 
+      error: error.message || 'Failed to update Gmail account',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Delete a Gmail account
+router.delete('/admin/accounts/:accountId', async (req, res) => {
+  try {
+    // Check admin passphrase
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const { accountId } = req.params;
+    
+    // Check if account exists
+    const [accounts] = await pool.query(
+      'SELECT id FROM gmail_accounts WHERE id = ?',
+      [accountId]
+    );
+    
+    if (accounts.length === 0) {
+      return res.status(404).json({ error: 'Gmail account not found' });
+    }
+    
+    // Delete the account
+    await pool.query(
+      'DELETE FROM gmail_accounts WHERE id = ?',
+      [accountId]
+    );
+    
+    res.json({ message: 'Gmail account deleted successfully' });
+  } catch (error) {
+    console.error('Failed to delete Gmail account:', error);
+    res.status(400).json({ 
+      error: error.message || 'Failed to delete Gmail account',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// Toggle Gmail account status
+router.patch('/admin/accounts/:accountId/status', async (req, res) => {
+  try {
+    // Check admin passphrase
+    const adminAccess = req.headers['admin-access'];
+    if (adminAccess !== process.env.ADMIN_PASSPHRASE) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    const { accountId } = req.params;
+    const { status } = req.body;
+    
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+    
+    // Check if account exists
+    const [accounts] = await pool.query(
+      'SELECT id, email, status FROM gmail_accounts WHERE id = ?',
+      [accountId]
+    );
+    
+    if (accounts.length === 0) {
+      return res.status(404).json({ error: 'Gmail account not found' });
+    }
+    
+    const account = accounts[0];
+    
+    // Update account status
+    await pool.query(
+      'UPDATE gmail_accounts SET status = ?, updated_at = NOW() WHERE id = ?',
+      [status, accountId]
+    );
+    
+    // If we're activating an account that was previously inactive, we may need to restart polling
+    if (status === 'active' && account.status !== 'active') {
+      // You may need to call a function from your gmailImapService here
+      // For example: await gmailImapService.restartPolling(account.email);
+      console.log(`Account ${account.email} status changed to active`);
+    }
+    
+    res.json({ message: 'Gmail account status updated successfully', status });
+  } catch (error) {
+    console.error('Failed to update Gmail account status:', error);
+    res.status(400).json({ 
+      error: error.message || 'Failed to update Gmail account status',
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
 // Get Gmail accounts statistics
 router.get('/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
   try {

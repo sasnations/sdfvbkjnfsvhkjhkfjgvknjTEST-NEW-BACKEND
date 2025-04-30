@@ -17,11 +17,16 @@ import monitorRoutes from './routes/monitor.js';
 import gmailRoutes from './routes/gmailRoutes.js'; // Added Gmail routes
 import debugRoutes from './routes/debug.js'; // Added Debug routes
 import nodemailer from 'nodemailer';
+import http from 'http'; // Added for WebSocket support
+import { setupWebSocketServer } from './services/gmailImapService.js'; // Added for WebSocket
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Create HTTP server (instead of using app.listen)
+const server = http.createServer(app);
 
 // Create mail transporter
 export const mailTransporter = nodemailer.createTransport({
@@ -181,12 +186,14 @@ function scheduleCleanup() {
 
 // Initialize database and start server
 initializeDatabase().then(() => {
-  app.listen(port, '0.0.0.0', () => {
+  server.listen(port, '0.0.0.0', () => {
     console.log(`Server running on port ${port}`);
     scheduleCleanup();
     console.log('Email cleanup scheduler started');
     
-   
+    // Setup WebSocket server for real-time email updates
+    setupWebSocketServer(server);
+    console.log('WebSocket server initialized for real-time email updates');
   });
 }).catch(error => {
   console.error('Failed to initialize database:', error);

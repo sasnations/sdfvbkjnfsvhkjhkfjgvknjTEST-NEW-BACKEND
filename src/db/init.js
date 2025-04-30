@@ -321,6 +321,23 @@ async function createTables(connection) {
       INDEX idx_user_id (user_id)
     ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
   `);
+  
+  // Gmail accounts table
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS gmail_accounts (
+      id VARCHAR(36) PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      app_password TEXT,
+      quota_used INT DEFAULT 0,
+      alias_count INT DEFAULT 0,
+      status VARCHAR(20) DEFAULT 'active',
+      last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_email (email),
+      INDEX idx_status (status)
+    ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+  `);
 }
 
 // Cleanup function with stats logging

@@ -2,20 +2,22 @@ import { ImapFlow } from 'imapflow';
 import { v4 as uuidv4 } from 'uuid';
 import { pool } from '../db/init.js';
 import crypto from 'crypto';
+import { WebSocketServer } from 'ws';
 
 // In-memory storage
 const emailCache = new Map(); // Cache for fetched emails
 const aliasCache = new Map(); // Cache for active aliases during runtime
 const activeImapAccounts = new Set(); // Track which accounts are being actively polled
 const imapClients = new Map(); // Store active IMAP clients
+const connectedClients = new Map(); // Map of userId:alias -> Set of websocket connections
 
 // Configuration
 const MAX_CACHE_SIZE = 10000; // Maximum number of emails to cache
 const ALIAS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds for in-memory cache
 const POLLING_INTERVALS = {
-  high: 60000,     // 1 minute for high priority accounts
-  medium: 180000,  // 3 minutes for medium priority
-  low: 300000      // 5 minutes for low priority accounts
+  high: 30000,     // 30 seconds for high priority accounts
+  medium: 60000,   // 1 minute for medium priority
+  low: 180000      // 3 minutes for low priority accounts
 };
 
 // Encryption utilities for password security
@@ -37,6 +39,108 @@ function decrypt(text) {
   let decrypted = decipher.update(encryptedText);
   decrypted = Buffer.concat([decrypted, decipher.final()]);
   return decrypted.toString();
+}
+
+// Setup WebSocket Server
+export function setupWebSocketServer(server) {
+  const wss = new WebSocketServer({ server });
+  
+  console.log('WebSocket server created for real-time email updates');
+  
+  wss.on('connection', (ws, req) => {
+    // Extract userId and alias from URL parameters
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const userId = url.searchParams.get('userId');
+    const alias = url.searchParams.get('alias');
+    
+    if (!userId || !alias) {
+      console.log('WebSocket connection rejected: missing userId or alias');
+      ws.close();
+      return;
+    }
+    
+    const clientKey = `${userId}:${alias}`;
+    console.log(`WebSocket client connected: ${clientKey}`);
+    
+    // Add to connected clients
+    if (!connectedClients.has(clientKey)) {
+      connectedClients.set(clientKey, new Set());
+    }
+    connectedClients.get(clientKey).add(ws);
+    
+    // Send initial message
+    ws.send(JSON.stringify({
+      type: 'connected',
+      message: 'Connected successfully to real-time email updates',
+      timestamp: new Date().toISOString(),
+      alias
+    }));
+    
+    // Handle client disconnect
+    ws.on('close', () => {
+      console.log(`WebSocket client disconnected: ${clientKey}`);
+      if (connectedClients.has(clientKey)) {
+        connectedClients.get(clientKey).delete(ws);
+        if (connectedClients.get(clientKey).size === 0) {
+          connectedClients.delete(clientKey);
+        }
+      }
+    });
+    
+    // Handle client messages
+    ws.on('message', (message) => {
+      try {
+        const data = JSON.parse(message);
+        
+        // Handle ping message to keep connection alive
+        if (data.type === 'ping') {
+          ws.send(JSON.stringify({
+            type: 'pong',
+            timestamp: new Date().toISOString()
+          }));
+        }
+      } catch (err) {
+        console.error('Invalid WebSocket message:', err);
+      }
+    });
+  });
+  
+  // Log websocket stats every 5 minutes
+  setInterval(() => {
+    console.log(`WebSocket stats: ${connectedClients.size} unique aliases connected`);
+    let totalConnections = 0;
+    for (const clients of connectedClients.values()) {
+      totalConnections += clients.size;
+    }
+    console.log(`Total WebSocket connections: ${totalConnections}`);
+  }, 5 * 60 * 1000);
+  
+  return wss;
+}
+
+// Utility function to notify all connected clients for an alias
+function notifyClients(alias, email) {
+  for (const [clientKey, clients] of connectedClients.entries()) {
+    const [userId, clientAlias] = clientKey.split(':');
+    
+    if (clientAlias === alias) {
+      const notification = {
+        type: 'new_email',
+        email,
+        alias,
+        timestamp: new Date().toISOString()
+      };
+      
+      const payload = JSON.stringify(notification);
+      
+      for (const client of clients) {
+        if (client.readyState === 1) { // OPEN
+          client.send(payload);
+          console.log(`Notified client ${clientKey} about new email`);
+        }
+      }
+    }
+  }
 }
 
 // Gmail Account Management
@@ -91,6 +195,17 @@ export async function addGmailAccount(email, appPassword) {
       }
       
       await connection.commit();
+      
+      // Test the IMAP connection to verify credentials
+      try {
+        const client = await createImapClient(email);
+        await client.connect();
+        await client.logout();
+        console.log(`Successfully verified IMAP connection for ${email}`);
+      } catch (imapError) {
+        console.error(`IMAP connection test failed for ${email}:`, imapError);
+        throw new Error(`Failed to connect to IMAP server: ${imapError.message}`);
+      }
       
       // Start polling for this account
       if (!activeImapAccounts.has(email)) {
@@ -497,6 +612,9 @@ async function pollForNewEmails(accountEmail) {
           if (!emailCache.has(cacheKey)) {
             addToEmailCache(cacheKey, processedEmail);
             console.log(`Added message ${message.uid} to cache for ${recipientAlias}`);
+            
+            // Notify connected clients about the new email (WebSocket)
+            notifyClients(recipientAlias, processedEmail);
           }
         }
       } catch (messageError) {
@@ -1026,7 +1144,9 @@ export async function initializeImapService() {
     }
     
     console.log('IMAP service initialized successfully');
+    return true;
   } catch (error) {
     console.error('Failed to initialize IMAP service:', error);
+    return false;
   }
 }
